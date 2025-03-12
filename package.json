@@ -1,0 +1,31 @@
+{
+	"name": "jobgoblin-backend",
+	"version": "1.0.0",
+	"description": "Backend API for Job Goblin",
+	"main": "index.js",
+	"type": "module",
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/burnsidion/jobgoblin-backend.git"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"bugs": {
+		"url": "https://github.com/burnsidion/jobgoblin-backend/issues"
+	},
+	"homepage": "https://github.com/burnsidion/jobgoblin-backend#readme",
+	"dependencies": {
+		"bcrypt": "^5.1.1",
+		"cors": "^2.8.5",
+		"dotenv": "^16.4.7",
+		"eslint": "^9.22.0",
+		"express": "^4.21.2",
+		"jsonwebtoken": "^9.0.2",
+		"postgresql": "^0.0.1",
+		"supabase": "^2.19.5"
+	}
+}
