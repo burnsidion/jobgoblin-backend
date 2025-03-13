@@ -1,5 +1,6 @@
 import express from "express";
 import supabase from "../supabaseClient.js";
+import authMiddleware from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
@@ -7,17 +8,15 @@ const router = express.Router();
 router.post("/signup", async (req, res) => {
 	const { email, password, first_name, last_name } = req.body;
 
-	// Sign up the user with Supabase Auth
 	const { data, error } = await supabase.auth.signUp({ email, password });
 
 	if (error) return res.status(400).json({ error: error.message });
 
-	// If signup was successful, insert user into "users" table
-	const userId = data.user?.id; // Get the user ID from Supabase auth
+	const userId = data.user?.id;
 	if (userId) {
 		const { error: insertError } = await supabase
 			.from("users")
-			.insert([{ id: userId, email, first_name, last_name }]); // 🔹 Removed "password"
+			.insert([{ id: userId, email, first_name, last_name }]);
 
 		if (insertError)
 			return res.status(400).json({ error: insertError.message });
@@ -38,6 +37,10 @@ router.post("/login", async (req, res) => {
 	if (error) return res.status(400).json({ error: error.message });
 
 	res.json({ user: data });
+});
+
+router.get("/profile", authMiddleware, async (req, res) => {
+	res.json({ user: req.user });
 });
 
 export default router;
