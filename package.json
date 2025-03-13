@@ -26,7 +26,9 @@
 		"eslint": "^9.22.0",
 		"express": "^4.21.2",
 		"jsonwebtoken": "^9.0.2",
+		"multer": "^1.4.5-lts.1",
 		"postgresql": "^0.0.1",
-		"supabase": "^2.19.5"
+		"supabase": "^2.19.5",
+		"uuid": "^11.1.0"
 	}
 }
