@@ -1,11 +1,12 @@
 import express from "express";
-import supabase from "../supabaseClient.js";
+import getSupabaseClient from "../supabaseClient.js";
 import authMiddleware from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
 // User Signup
 router.post("/signup", async (req, res) => {
+	const supabase = getSupabaseClient();
 	const { email, password, first_name, last_name } = req.body;
 
 	const { data, error } = await supabase.auth.signUp({ email, password });
@@ -40,6 +41,7 @@ router.post("/signup", async (req, res) => {
 
 // User Login
 router.post("/login", async (req, res) => {
+	const supabase = getSupabaseClient();
 	const { email, password } = req.body;
 
 	const { data, error } = await supabase.auth.signInWithPassword({
@@ -67,6 +69,8 @@ router.post("/login", async (req, res) => {
 
 // User Logout
 router.post("/logout", authMiddleware, async (req, res) => {
+	const supabase = getSupabaseClient(req.token);
+
 	const { error } = await supabase.auth.signOut();
 
 	if (error) return res.status(400).json({ error: error.message });
@@ -78,4 +82,5 @@ router.post("/logout", authMiddleware, async (req, res) => {
 router.get("/profile", authMiddleware, async (req, res) => {
 	res.json({ user: req.user });
 });
+
 export default router;
