@@ -3,6 +3,9 @@ import getSupabaseClient from "../supabaseClient.js";
 import authMiddleware from "../middleware/authMiddleware.js";
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
+import cloudinary from "../cloudinaryConfig.js";
+import fs from "fs";
+import path from "path";
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -36,12 +39,16 @@ router.post(
 			const file = req.file;
 			const fileExtension = file.originalname.split(".").pop();
 			const fileName = `${uuidv4()}.${fileExtension}`;
+			const tempFilePath = path.join("/tmp", fileName); // Temporary file path
+
+			// 🔹 Write file to disk temporarily
+			fs.writeFileSync(tempFilePath, file.buffer);
 
 			const supabaseAdmin = getSupabaseClient(
 				process.env.SUPABASE_SERVICE_ROLE_KEY
 			);
 
-			// Upload file to Supabase Storage
+			// 🔹 Upload PDF to Supabase Storage
 			const { data, error } = await supabaseAdmin.storage
 				.from("resumes")
 				.upload(`users/${userId}/${fileName}`, file.buffer, {
@@ -54,14 +61,34 @@ router.post(
 
 			const fileUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/resumes/users/${userId}/${fileName}`;
 
-			// 🔹 Insert the resume reference into the `resumes` table
+			// 🔹 Upload the first page of the PDF to Cloudinary as PNG (using local file path)
+			const cloudinaryResponse = await cloudinary.uploader.upload(
+				tempFilePath, // Use the temporary file path, NOT the buffer
+				{
+					folder: "resume_previews",
+					resource_type: "image", // Ensure this is set to "image"
+					format: "png", // Convert PDF to PNG
+					pages: "1", // Upload only the first page
+				}
+			);
+
+			if (!cloudinaryResponse.secure_url) {
+				return res
+					.status(500)
+					.json({ error: "Failed to generate resume preview" });
+			}
+
+			const previewUrl = cloudinaryResponse.secure_url; // PNG URL
+
+			// 🔹 Insert into Supabase database (including PNG preview URL)
 			const { error: insertError } = await supabaseAdmin
 				.from("resumes")
 				.insert([
 					{
 						user_id: userId,
 						resume_name: file.originalname,
-						resume_file: fileUrl,
+						resume_file: fileUrl, // PDF file in Supabase
+						preview_image: previewUrl, // PNG preview in Cloudinary
 						file_type: file.mimetype,
 					},
 				]);
@@ -70,9 +97,14 @@ router.post(
 				return res.status(500).json({ error: insertError.message });
 			}
 
-			res
-				.status(201)
-				.json({ message: "Resume uploaded successfully", fileUrl });
+			// 🔹 Delete the temporary file after upload
+			fs.unlinkSync(tempFilePath);
+
+			res.status(201).json({
+				message: "Resume uploaded successfully",
+				fileUrl,
+				previewUrl,
+			});
 		} catch (err) {
 			console.error("Upload error:", err);
 			res.status(500).json({ error: "Internal server error" });
