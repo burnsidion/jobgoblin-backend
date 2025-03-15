@@ -9,6 +9,7 @@ import path from "path";
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
+
 router.get("/", authMiddleware, async (req, res) => {
 	const userId = req.user.id;
 
@@ -39,16 +40,16 @@ router.post(
 			const file = req.file;
 			const fileExtension = file.originalname.split(".").pop();
 			const fileName = `${uuidv4()}.${fileExtension}`;
-			const tempFilePath = path.join("/tmp", fileName); // Temporary file path
+			const tempFilePath = path.join("/tmp", fileName);
 
-			// 🔹 Write file to disk temporarily
+			// Write file to disk temporarily
 			fs.writeFileSync(tempFilePath, file.buffer);
 
 			const supabaseAdmin = getSupabaseClient(
 				process.env.SUPABASE_SERVICE_ROLE_KEY
 			);
 
-			// 🔹 Upload PDF to Supabase Storage
+			// Upload PDF to Supabase Storage
 			const { data, error } = await supabaseAdmin.storage
 				.from("resumes")
 				.upload(`users/${userId}/${fileName}`, file.buffer, {
@@ -61,14 +62,14 @@ router.post(
 
 			const fileUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/resumes/users/${userId}/${fileName}`;
 
-			// 🔹 Upload the first page of the PDF to Cloudinary as PNG (using local file path)
+			// Upload the first page of the PDF to Cloudinary as PNG (using local file path)
 			const cloudinaryResponse = await cloudinary.uploader.upload(
-				tempFilePath, // Use the temporary file path, NOT the buffer
+				tempFilePath,
 				{
 					folder: "resume_previews",
-					resource_type: "image", // Ensure this is set to "image"
-					format: "png", // Convert PDF to PNG
-					pages: "1", // Upload only the first page
+					resource_type: "image",
+					format: "png",
+					pages: "1",
 				}
 			);
 
@@ -78,17 +79,17 @@ router.post(
 					.json({ error: "Failed to generate resume preview" });
 			}
 
-			const previewUrl = cloudinaryResponse.secure_url; // PNG URL
+			const previewUrl = cloudinaryResponse.secure_url;
 
-			// 🔹 Insert into Supabase database (including PNG preview URL)
+			// Insert into Supabase database (including PNG preview URL)
 			const { error: insertError } = await supabaseAdmin
 				.from("resumes")
 				.insert([
 					{
 						user_id: userId,
 						resume_name: file.originalname,
-						resume_file: fileUrl, // PDF file in Supabase
-						preview_image: previewUrl, // PNG preview in Cloudinary
+						resume_file: fileUrl,
+						preview_image: previewUrl,
 						file_type: file.mimetype,
 					},
 				]);
@@ -97,7 +98,7 @@ router.post(
 				return res.status(500).json({ error: insertError.message });
 			}
 
-			// 🔹 Delete the temporary file after upload
+			// Delete the temporary file after upload
 			fs.unlinkSync(tempFilePath);
 
 			res.status(201).json({
@@ -112,4 +113,64 @@ router.post(
 	}
 );
 
+router.delete("/:id", async (req, res) => {
+	const { id } = req.params;
+
+	if (!id) {
+		return res.status(400).json({ error: "Resume ID is required" });
+	}
+
+	try {
+		console.log(`Attempting to delete resume with ID: ${id}`);
+
+		const supabase = getSupabaseClient(process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+		// Fetch the resume entry to get the storage path
+		const { data: resume, error: fetchError } = await supabase
+			.from("resumes")
+			.select("id, resume_file")
+			.eq("id", id)
+			.single();
+
+		if (fetchError || !resume) {
+			console.error("Resume fetch error:", fetchError);
+			return res.status(404).json({ error: "Resume not found" });
+		}
+
+		console.log("Resume found:", resume);
+
+		// Extract the file name from the URL
+		const filePath = resume.resume_file.split("/").pop();
+		console.log("Extracted filePath:", filePath);
+
+		// Delete from Supabase Storage
+		const { error: storageError } = await supabase.storage
+			.from("resumes")
+			.remove([`users/${id}/${filePath}`]);
+
+		if (storageError) {
+			console.error("Storage deletion error:", storageError);
+			return res.status(500).json({ error: "Failed to delete file from storage" });
+		}
+
+		console.log("File deleted from storage");
+
+		// Delete from database
+		const { error: deleteError } = await supabase
+			.from("resumes")
+			.delete()
+			.eq("id", id);
+
+		if (deleteError) {
+			console.error("Database deletion error:", deleteError);
+			return res.status(500).json({ error: "Failed to delete resume from database" });
+		}
+
+		console.log("Resume deleted from database");
+		res.json({ message: "Resume deleted successfully" });
+	} catch (error) {
+		console.error("Unexpected server error:", error);
+		res.status(500).json({ error: "Something went wrong" });
+	}
+});
 export default router;
