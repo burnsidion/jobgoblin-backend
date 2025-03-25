@@ -49,44 +49,40 @@ router.get("/", authMiddleware, async (req, res) => {
 router.post(
 	"/tailor-resume",
 	authMiddleware,
-	upload.single("resume_used"),
+	upload.single("resume"),
 	async (req, res) => {
 		try {
 			const userId = req.user.id;
 			const { job_description } = req.body;
 			const resumeFile = req.file;
 
-			if (!resumeFile || !job_description) {
-				return res
-					.status(400)
-					.json({ error: "Resume and job description are required" });
+			// Validate input
+			if (!resumeFile) {
+				return res.status(400).json({ error: "No resume file uploaded." });
+			}
+			if (!job_description) {
+				return res.status(400).json({ error: "Job description is required." });
 			}
 
+			// Step 1: Parse PDF
 			let resumeText = "";
+			const parsePDF = async (buffer) => {
+				const tempFilePath = path.join(__dirname, "../temp_upload.pdf");
+				await writeFileAsync(tempFilePath, buffer);
+				return new Promise((resolve, reject) => {
+					pdf(tempFilePath, pdfOptions, (err, text) => {
+						unlinkFileAsync(tempFilePath).catch(console.error);
+						if (err) {
+							console.error("PDF Parsing Error:", err);
+							reject("Failed to extract resume text.");
+						} else {
+							resolve(text);
+						}
+					});
+				});
+			};
+
 			try {
-				const parsePDF = async (buffer) => {
-					const tempFilePath = path.join(__dirname, "../temp_upload.pdf");
-
-					try {
-						await writeFileAsync(tempFilePath, buffer);
-
-						return new Promise((resolve, reject) => {
-							pdf(tempFilePath, pdfOptions, (err, text) => {
-								unlinkFileAsync(tempFilePath).catch(console.error);
-								if (err) {
-									console.error("PDF Parsing Error:", err);
-									reject("Failed to extract resume text.");
-								} else {
-									resolve(text);
-								}
-							});
-						});
-					} catch (err) {
-						console.error("Error handling PDF file:", err);
-						throw new Error("Failed to process PDF file.");
-					}
-				};
-
 				resumeText = await parsePDF(resumeFile.buffer);
 			} catch (err) {
 				console.error("PDF Parsing Error:", err);
@@ -95,242 +91,166 @@ router.post(
 					.json({ error: err || "Failed to extract resume text." });
 			}
 
-			// Make request to OpenAI API
+			// Step 2: Call OpenAI (Short Summary Only)
 			const response = await openaiClient.post("/chat/completions", {
 				model: "gpt-4-turbo",
+				max_tokens: 150,
 				messages: [
 					{
 						role: "system",
 						content: `
-							You are a professional resume tailoring assistant. Adjust the provided resume to align with the given job description.
-							Format the response into the following clearly labeled sections:
-							- ## Summary
-							- ## Technical Skills
-							- ## Work Experience
-							- ## Education
+						  You are a professional resume tailoring assistant.
+						  The user has removed their name and contact info from the resume.
+						  DO NOT reintroduce any name, phone number, email, or location.
+						  Adjust the provided resume text to align with the given job description.
 
-							Ensure proper spacing and structure so that each section is clearly distinguishable.
-							DO NOT include the candidate's name, contact information, or LinkedIn/Portfolio/GitHub links (these will be added separately).
-							Extract and return any hyperlinks found in the resume immediately beneath the contact information.
+						  Return EXACTLY 3 sentences (no more, no less) summarizing the individual's
+						  relevant skills and experience for the role, without using the phrase "the candidate."
+						  Do not provide any other sections or headings.
+						  Do not include any personal identifiers.
 						`,
 					},
 					{
 						role: "user",
-						content: `Here is my original resume (excluding my name & contact info):\n\n---\n${resumeText}\n---\n\nHere is the job description:\n\n---\n${job_description}\n---\n\nGenerate a **tailored** version of my resume that **aligns with the job description** while ensuring all of my original resume's **details, structure, and project descriptions remain intact**.`,
+						content: `
+				  Here is my original resume text (excluding name/contact info):
+				  ---
+				  ${resumeText}
+				  ---
+
+				  Here is the job description:
+				  ---
+				  ${job_description}
+				  ---
+
+				  Please tailor the resume text to align with the job description,
+				  but return EXACTLY 3 sentences summarizing my relevant skills and experience.
+				`,
 					},
 				],
 			});
 
-			// Extract Hyperlinks
-			let fullAIResponse = response.data.choices[0].message.content;
-			let linkSectionIndex = fullAIResponse.lastIndexOf("Hyperlinks:");
-			let tailoredResumeText =
-				linkSectionIndex > -1
-					? fullAIResponse.substring(0, linkSectionIndex).trim()
-					: fullAIResponse.trim();
-
-			let links = [];
-			if (linkSectionIndex > -1) {
-				let linkLines = fullAIResponse
-					.substring(linkSectionIndex)
-					.split("\n")
-					.slice(1);
-				links = linkLines
-					.map((line) => line.match(/- (.+?): \[(.+?)\]/))
-					.filter((match) => match)
-					.map((match) => ({ label: match[1], url: match[2] }));
+			function limitSentences(text, maxSentences) {
+				const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
+				return sentences.slice(0, maxSentences).join(" ").trim();
 			}
 
-			// Ensure hyperlinks are clickable and bold formatting is applied correctly
-			let tailoredResumeTextProcessed = tailoredResumeText
-				.replace(/[^\x00-\x7F]/g, "") // Remove non-ASCII characters
-				.replace(/\r\n|\r/g, "\n") // Normalize newlines
-				.replace(/\n{3,}/g, "\n\n") // Allow double newlines for section spacing
-				.replace(/\*\*/g, "") // Remove rogue asterisks
-				.replace(/### (.*?)\n/g, "$1\n") // Convert markdown headers
-				.trim();
+			let rawTailoredText = response.data.choices[0].message.content.trim();
+			let tailoredText = rawTailoredText.replace(/[^\x00-\x7F]/g, "");
+			tailoredText = tailoredText.replace(/the candidate/gi, "").trim();
 
-			// Generate a PDF
+			// Step 3: Generate a PDF (Header + Contact + Summary)
 			const pdfDoc = await PDFDocument.create();
 			const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 			const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-			const pageWidth = 600;
-			const pageHeight = 800;
+
+			const page = pdfDoc.addPage();
+			const { width, height } = page.getSize();
+
+			// Header Section
+			const candidateName = "Ian Burnside";
+			const candidateTitle = "FRONTEND DEVELOPER | VUE.JS SPECIALIST";
+
+			page.drawText(candidateName, {
+				x: 50,
+				y: height - 50,
+				size: 24,
+				font,
+			});
+
+			page.drawText(candidateTitle, {
+				x: 50,
+				y: height - 80,
+				size: 16,
+				font,
+			});
+
+			// Contact Info
+			let yPos = height - 110;
+			const contactFontSize = 12;
+			const contacts = [
+				{ label: "Boulder, CO" },
+				{ label: "561-715-6031" },
+				{ label: "ian.burnside89@gmail.com" },
+			];
+			for (const contact of contacts) {
+				page.drawText(contact.label, {
+					x: 50,
+					y: yPos,
+					size: contactFontSize,
+					font,
+				});
+				yPos -= 15;
+			}
+
+			// Summary Heading
+			yPos -= 30;
+			page.drawText("SUMMARY", {
+				x: 50,
+				y: yPos,
+				size: 14,
+				font: boldFont,
+			});
+
+			// Simple line wrapping for summary
+			yPos -= 20;
+			const lineHeight = 14;
 			const margin = 50;
-			const lineHeight = 16; // Adjust line spacing
-			const maxTextWidth = pageWidth - margin * 2;
+			const maxTextWidth = width - margin * 2;
 
-			// Create first page
-			let page = pdfDoc.addPage([pageWidth, pageHeight]);
-			let y = pageHeight - margin; // Start from the top margin
-
-			// Draw header (Centered Name & Contact Info)
-			const titleFontSize = 18;
-			const textFontSize = 12;
-
-			page.drawText("Ian Burnside", {
-				x: margin,
+			function drawWrappedText(
+				page,
+				text,
+				x,
 				y,
-				size: titleFontSize,
-				font,
-			});
-			y -= 25; // Move down after name
+				{ font, size, maxWidth, lineHeight }
+			) {
+				const words = text.split(/\s+/);
+				let currentLine = "";
 
-			const contactInfo = `Boulder, CO | 561-715-6031 | ian.burnside89@gmail.com`;
-			page.drawText(contactInfo, {
-				x: margin,
-				y,
-				size: textFontSize,
-				font,
-			});
-			y -= 15; // Move down after contact info
-
-			// Place Hyperlinks Beneath Header
-			const linkSpacing = 80;
-			links.forEach((link, index) => {
-				page.drawText(link.label, {
-					x: margin + index * linkSpacing,
-					y,
-					size: textFontSize,
-					font: boldFont,
-					color: rgb(0, 0, 1),
-				});
-
-				// Add clickable area for hyperlinks
-				page.addAnnotation({
-					type: "Link",
-					rect: [
-						margin + index * linkSpacing,
-						y,
-						margin + index * linkSpacing + 70,
-						y + 12,
-					],
-					url: link.url,
-				});
-			});
-
-			y -= 20; // Adjust spacing after hyperlinks
-
-			// Function to wrap text onto new pages
-			const addWrappedText = (text, font, page, y) => {
-				const lines = text.split("\n");
-				const titleFontSize = 14;
-				const textFontSize = 12;
-				for (const line of lines) {
-					if (line.startsWith("## ")) {
-						// Section headers (bold and larger font)
-						y -= 30; // Extra spacing before headers
-						page.drawText(line.replace("## ", ""), {
-							x: 50,
-							y,
-							size: titleFontSize,
-							font: boldFont,
-							color: rgb(0, 0, 0),
-						});
-						y -= 20; // Extra spacing after headers
+				for (const word of words) {
+					const testLine = currentLine + word + " ";
+					const textWidth = font.widthOfTextAtSize(testLine, size);
+					if (textWidth > maxWidth) {
+						page.drawText(currentLine.trim(), { x, y, size, font });
+						y -= lineHeight;
+						currentLine = word + " ";
 					} else {
-						// Wrap text properly
-						const words = line.split(" ");
-						let currentLine = "";
-
-						for (const word of words) {
-							if (word.startsWith("**") && word.endsWith("**")) {
-								const boldWord = word.slice(2, -2);
-								const testLine = currentLine + boldWord + " ";
-								const textWidth = boldFont.widthOfTextAtSize(
-									testLine,
-									textFontSize
-								);
-
-								if (textWidth > maxTextWidth) {
-									// If text is too long, move to new line
-									if (y - lineHeight * 2 < margin) {
-										page = pdfDoc.addPage([pageWidth, pageHeight]);
-										y = pageHeight - margin;
-									}
-									if (y < 50) {
-										// If near bottom, start new page
-										page = pdfDoc.addPage([600, 800]);
-										y = page.getHeight() - 50;
-									}
-									page.drawText(currentLine.trim(), {
-										x: 50,
-										y,
-										size: textFontSize,
-										font,
-									});
-									y -= 15;
-									currentLine = boldWord + " ";
-								} else {
-									currentLine = testLine;
-								}
-							} else {
-								const testLine = currentLine + word + " ";
-								const textWidth = font.widthOfTextAtSize(
-									testLine,
-									textFontSize
-								);
-
-								if (textWidth > maxTextWidth) {
-									// If text is too long, move to new line
-									if (y - lineHeight * 2 < margin) {
-										page = pdfDoc.addPage([pageWidth, pageHeight]);
-										y = pageHeight - margin;
-									}
-									if (y < 50) {
-										// If near bottom, start new page
-										page = pdfDoc.addPage([600, 800]);
-										y = page.getHeight() - 50;
-									}
-									page.drawText(currentLine.trim(), {
-										x: 50,
-										y,
-										size: textFontSize,
-										font,
-									});
-									y -= 15;
-									currentLine = word + " ";
-								} else {
-									currentLine = testLine;
-								}
-							}
-						}
-
-						if (currentLine.trim()) {
-							if (y < 50) {
-								page = pdfDoc.addPage([600, 800]);
-								y = page.getHeight() - 50;
-							}
-							page.drawText(currentLine.trim(), {
-								x: 50,
-								y,
-								size: textFontSize,
-								font,
-							});
-							y -= 15;
-						}
+						currentLine = testLine;
 					}
 				}
-			};
 
-			// Draw resume text with wrapping
-			addWrappedText(tailoredResumeTextProcessed, font, page, y);
+				// leftover text
+				if (currentLine.trim()) {
+					page.drawText(currentLine.trim(), { x, y, size, font });
+					y -= lineHeight;
+				}
 
+				return y;
+			}
+
+			yPos = drawWrappedText(page, tailoredText, 50, yPos, {
+				font,
+				size: 12,
+				maxWidth: maxTextWidth,
+				lineHeight,
+			});
+
+			// Finalize PDF
 			const pdfBytes = await pdfDoc.save();
 
-			// Send the PDF file as a response
 			res.setHeader(
 				"Content-Disposition",
 				"attachment; filename=tailored_resume.pdf"
 			);
 			res.setHeader("Content-Type", "application/pdf");
-			res.send(Buffer.from(pdfBytes));
+			return res.send(Buffer.from(pdfBytes));
 		} catch (error) {
 			console.error(
 				"Error calling OpenAI:",
 				error.response?.data || error.message
 			);
-			res.status(500).json({ error: "Failed to connect to OpenAI" });
+			return res.status(500).json({ error: "Failed to connect to OpenAI" });
 		}
 	}
 );
