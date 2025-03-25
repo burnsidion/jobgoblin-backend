@@ -3,6 +3,8 @@ import cors from "cors";
 import authRoutes from "./routes/authRoutes.js";
 import resumeRoutes from "./routes/resumeRoutes.js";
 import applicationRoutes from "./routes/applicationRoutes.js";
+import dotenv from "dotenv";
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5005;
