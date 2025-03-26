@@ -27,39 +27,41 @@ const upload = multer({ storage: multer.memoryStorage() });
 /**
  * We keep the sanitizePdfString logic,
  * but be aware it strips out non-ASCII (including bullet '•').
- * If that’s causing issues, you can remove the line that strips non-ASCII.
  */
 function sanitizePdfString(str) {
 	if (!str) return "";
 	// Replace bullet (•) with a placeholder
 	let replaced = str.replace(/•/g, "BULLET_PLACEHOLDER");
-	// Remove all non-ASCII characters
+	// Remove all non-ASCII characters except bullet
 	replaced = replaced.replace(/[^\x00-\x7F•]/g, "");
 	// Restore placeholder as an ASCII bullet marker
 	replaced = replaced.replace(/BULLET_PLACEHOLDER/g, "* ");
 	return replaced;
 }
 
-function parseSocialLinks(lines) {
-	// This regex matches anything that starts with http(s):// and goes until whitespace
-	const linkRegex = /(https?:\/\/\S+)/gi;
+function ensureSpace(page, pdfDoc, yPos, threshold = 60) {
+	if (yPos < threshold) {
+		page = pdfDoc.addPage();
+		yPos = page.getSize().height - 50;
+	}
+	return { page, yPos };
+}
 
-	let linkedin = "";
-	let portfolio = "";
-	let github = "";
+/** Social Links & Lines **/
+function parseSocialLinks(lines) {
+	const linkRegex = /(https?:\/\/\S+)/gi;
+	let linkedin = "",
+		portfolio = "",
+		github = "";
 
 	lines.forEach((line) => {
-		// Find all URLs in the current line
 		const matches = line.match(linkRegex);
 		if (!matches) return;
-
 		matches.forEach((url) => {
 			const lowerUrl = url.toLowerCase();
-			if (lowerUrl.includes("linkedin.com")) {
-				linkedin = url;
-			} else if (lowerUrl.includes("github.com")) {
-				github = url;
-			} else if (
+			if (lowerUrl.includes("linkedin.com")) linkedin = url;
+			else if (lowerUrl.includes("github.com")) github = url;
+			else if (
 				lowerUrl.includes("portfolio") ||
 				lowerUrl.includes("netlify") ||
 				lowerUrl.includes("vercel") ||
@@ -73,8 +75,6 @@ function parseSocialLinks(lines) {
 	return { linkedin, portfolio, github };
 }
 
-/** NEW: parseSocialLines, extractUrls, drawSocialLines **/
-
 function parseSocialLines(lines) {
 	const socialLines = [];
 	const keywords = ["linkedin", "github", "portfolio"];
@@ -82,54 +82,43 @@ function parseSocialLines(lines) {
 
 	lines.forEach((line) => {
 		const lower = line.toLowerCase();
-
-		// If it includes 'github'/'linkedin'/'portfolio'
 		const hasKeyword = keywords.some((kw) => lower.includes(kw));
-
-		// If it also includes 'version control'/'ci/cd', we skip it
 		const hasIgnoreWord = ignoreIfContains.some((ig) => lower.includes(ig));
-
 		if (hasKeyword && !hasIgnoreWord) {
 			socialLines.push(line);
 		}
 	});
-
 	return socialLines;
 }
 
 function extractUrls(line) {
 	const urlRegex = /(https?:\/\/\S+)/gi;
-	const matches = line.match(urlRegex) || [];
-	return matches;
+	return line.match(urlRegex) || [];
 }
 
-function drawSocialLines(page, lines, x, y, options) {
+function drawSocialLines(page, lines, x, yPos, options) {
 	const { font, size, color, lineHeight } = options;
 
 	lines.forEach((line) => {
-		// Draw the entire social line in the chosen color
 		page.drawText(sanitizePdfString(line), {
 			x,
-			y,
+			y: yPos,
 			size,
 			font,
 			color,
 		});
 
-		// If there are any URLs, create clickable link annotations
+		// clickable links
 		const urls = extractUrls(line);
 		if (urls.length > 0) {
 			let currentX = x;
 			const words = line.split(/\s+/);
-
-			// We'll do a rough measurement to place link annotations over each word
 			words.forEach((word) => {
 				const wordWidth = font.widthOfTextAtSize(word + " ", size);
 				if (urls.includes(word)) {
-					// Place an annotation over this word
 					page.linkAnnotation({
 						x: currentX,
-						y,
+						y: yPos,
 						width: wordWidth,
 						height: size,
 						url: word,
@@ -139,14 +128,210 @@ function drawSocialLines(page, lines, x, y, options) {
 			});
 		}
 
-		y -= lineHeight;
+		yPos -= lineHeight;
 	});
 
-	return y;
+	return yPos;
 }
 
-/** END NEW FUNCTIONS **/
+/** Wrapping & Bullets **/
+function wrapText(
+	page,
+	text,
+	x,
+	startYPos,
+	indent,
+	{ font, size, maxWidth, lineHeight }
+) {
+	let yPos = startYPos;
+	const words = text.split(/\s+/);
+	let currentLine = "";
 
+	words.forEach((word) => {
+		const sanitizedWord = sanitizePdfString(word);
+		const testLine = currentLine + sanitizedWord + " ";
+		const textWidth = font.widthOfTextAtSize(testLine, size);
+
+		if (textWidth > maxWidth - indent) {
+			page.drawText(sanitizePdfString(currentLine.trim()), {
+				x: x + indent,
+				y: yPos,
+				size,
+				font,
+			});
+			yPos -= lineHeight;
+			currentLine = sanitizedWord + " ";
+		} else {
+			currentLine = testLine;
+		}
+	});
+
+	if (currentLine.trim()) {
+		page.drawText(sanitizePdfString(currentLine.trim()), {
+			x: x + indent,
+			y: yPos,
+			size,
+			font,
+		});
+		yPos -= lineHeight;
+	}
+
+	return yPos;
+}
+
+function drawWrappedText(page, text, x, startYPos, options) {
+	return wrapText(page, text, x, startYPos, 0, options);
+}
+
+function parseBullets(text) {
+	return text.split(/\r?\n/).filter((line) => line.trim().match(/^[-•]\s+/));
+}
+
+function drawBulletedList(page, bulletLines, x, startYPos, options) {
+	let yPos = startYPos;
+	bulletLines.forEach((line) => {
+		const cleanLine = line.replace(/^[-•]\s+/, "");
+		page.drawText("•", {
+			x,
+			y: yPos,
+			size: options.size,
+			font: options.font,
+		});
+		yPos = wrapText(page, cleanLine, x + 15, yPos, 0, options);
+		yPos -= 5;
+	});
+	return yPos;
+}
+
+/** Nested Projects **/
+function parseNestedProjectBullets(text) {
+	const lines = text
+		.split(/\r?\n/)
+		.map((l) => l.trim())
+		.filter(Boolean);
+	const projects = [];
+	let currentProject = null;
+
+	lines.forEach((line) => {
+		if (line.startsWith("• ")) {
+			if (currentProject) projects.push(currentProject);
+			currentProject = {
+				projectTitle: line.replace(/^•\s*/, ""),
+				details: [],
+			};
+		} else if (line.startsWith("- ") && currentProject) {
+			const detail = line.replace(/^-\s*/, "");
+			currentProject.details.push(detail);
+		}
+	});
+	if (currentProject) projects.push(currentProject);
+
+	return projects;
+}
+
+function drawNestedProjects(page, projects, x, yPos, options, pdfDoc) {
+	const { font, size, maxWidth, lineHeight, boldFont } = options;
+	const detailIndent = 30;
+
+	projects.forEach((project) => {
+		({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
+		page.drawText(sanitizePdfString(project.projectTitle), {
+			x,
+			y: yPos,
+			size,
+			font: boldFont,
+		});
+		yPos -= lineHeight;
+		yPos -= 5;
+
+		project.details.forEach((detail) => {
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
+			page.drawText("•", {
+				x: x + detailIndent - 15,
+				y: yPos,
+				size,
+				font,
+			});
+			yPos = wrapText(
+				page,
+				sanitizePdfString(detail),
+				x + detailIndent,
+				yPos,
+				0,
+				{ font, size, maxWidth, lineHeight }
+			);
+			yPos -= 5;
+		});
+
+		yPos -= 10;
+	});
+	return yPos;
+}
+
+/** Nested Experience **/
+function parseNestedExperienceBullets(text) {
+	const lines = text
+		.split(/\r?\n/)
+		.map((l) => l.trim())
+		.filter(Boolean);
+	const roles = [];
+	let currentRole = null;
+
+	lines.forEach((line) => {
+		if (line.startsWith("• ")) {
+			if (currentRole) roles.push(currentRole);
+			currentRole = {
+				roleTitle: line.replace(/^•\s*/, ""),
+				details: [],
+			};
+		} else if (line.startsWith("- ") && currentRole) {
+			const detail = line.replace(/^-\s*/, "");
+			currentRole.details.push(detail);
+		}
+	});
+	if (currentRole) roles.push(currentRole);
+
+	return roles;
+}
+
+function drawNestedExperience(page, roles, x, yPos, options, pdfDoc) {
+	const { font, boldFont, size, maxWidth, lineHeight } = options;
+	const detailIndent = 30;
+
+	roles.forEach((role) => {
+		({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
+		page.drawText(role.roleTitle, {
+			x,
+			y: yPos,
+			size,
+			font: boldFont,
+		});
+		yPos -= lineHeight;
+		yPos -= 5;
+
+		role.details.forEach((detail) => {
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
+			page.drawText("•", {
+				x: x + detailIndent - 15,
+				y: yPos,
+				size,
+				font,
+			});
+			yPos = wrapText(page, detail, x + detailIndent, yPos, 0, {
+				font,
+				size,
+				maxWidth,
+				lineHeight,
+			});
+			yPos -= 5;
+		});
+
+		yPos -= 10;
+	});
+	return yPos;
+}
+
+/** Route Handler **/
 router.post(
 	"/tailor-resume",
 	authMiddleware,
@@ -165,7 +350,6 @@ router.post(
 			} = req.body;
 
 			const resumeFile = req.file;
-
 			if (!resumeFile) {
 				return res.status(400).json({ error: "No resume file uploaded." });
 			}
@@ -204,20 +388,14 @@ router.post(
 				resumeText = resumeText.join("\n");
 			}
 
-			// Social link variables (from parseSocialLinks)
-			let linkedin = "",
-				portfolio = "",
-				github = "";
-
 			// If candidate details are missing, attempt to extract from resume text
 			{
 				const lines = resumeText
 					.split(/\r?\n/)
 					.filter((line) => line.trim().length > 0);
+				// parse social links
+				let { linkedin, portfolio, github } = parseSocialLinks(lines);
 
-				({ linkedin, portfolio, github } = parseSocialLinks(lines));
-
-				// Attempt to extract candidate_name, candidate_title, etc.
 				if (!candidate_name) {
 					candidate_name = lines[0]
 						? lines[0].split(",")[0].trim()
@@ -226,7 +404,6 @@ router.post(
 				if (!candidate_title) {
 					candidate_title = lines[1] || "Candidate Title";
 				}
-
 				if (!candidate_location || !candidate_phone || !candidate_email) {
 					const contactLine = lines[2] || "";
 					if (!candidate_location) {
@@ -255,10 +432,11 @@ router.post(
 						content: `
                 You are a professional resume tailoring assistant.
                 DO NOT reintroduce any name, phone number, email, or location.
-                Return EXACTLY three sections in this order:
+                Return EXACTLY four sections in this order:
                 1) ## Summary (3-5 sentences) - no personal projects
                 2) ## Technical Skills (bullet points) - no personal projects
                 3) ## Highlighted Projects (bullet points) - only place personal projects here
+                4) ## Professional Experience (bullet points for each role)
 
                 Do not provide any other sections or headings.
                 Do not include any personal identifiers.
@@ -276,7 +454,19 @@ router.post(
                 • [Next Project Title]
                 - [Detail line 1]
                 - ...
-              `,
+
+                For Professional Experience, please use this exact structure:
+                ## Professional Experience
+                • [Job Title / Company / Years]
+                - [Bullet describing an achievement]
+                - [Another bullet]
+
+                (blank line)
+
+                • [Next Role Title / Company / Years]
+                - [Detail bullet]
+                - ...
+            `,
 					},
 					{
 						role: "user",
@@ -292,11 +482,12 @@ router.post(
                 ---
 
                 Please tailor the resume text to align with the job description,
-                returning EXACTLY three sections:
+                returning EXACTLY four sections:
                 1) ## Summary (3-5 sentences)
                 2) ## Technical Skills (bullet points)
                 3) ## Highlighted Projects (bullet points) – even if very brief.
-              `,
+                4) ## Professional Experience (bullet points for each role)
+            `,
 					},
 				],
 			});
@@ -304,12 +495,18 @@ router.post(
 			let rawTailoredText = response.data.choices[0].message.content.trim();
 			let tailoredText = rawTailoredText.replace(/the candidate/gi, "").trim();
 
-			// We have our final text, let's extract the three sections
+			// Extract sections
 			function extractSection(fullText, sectionHeader, nextSectionHeader) {
-				const pattern = new RegExp(
-					`${sectionHeader}[\\s\\S]*?(?=${nextSectionHeader}|$)`,
-					"i"
-				);
+				let pattern;
+				if (!nextSectionHeader) {
+					// Match everything from sectionHeader to the end of the text
+					pattern = new RegExp(`${sectionHeader}[\\s\\S]*$`, "i");
+				} else {
+					pattern = new RegExp(
+						`${sectionHeader}[\\s\\S]*?(?=${nextSectionHeader}|$)`,
+						"i"
+					);
+				}
 				const match = fullText.match(pattern);
 				if (!match) return "";
 				return match[0].replace(sectionHeader, "").trim();
@@ -328,190 +525,50 @@ router.post(
 			const highlightedProjectsText = extractSection(
 				tailoredText,
 				"## Highlighted Projects",
-				"$$$"
+				"## Professional Experience"
 			);
-
-			// Basic text wrapping
-			function wrapText(
-				page,
-				text,
-				x,
-				startY,
-				indent,
-				{ font, size, maxWidth, lineHeight }
-			) {
-				const words = text.split(/\s+/);
-				let currentLine = "";
-				let y = startY;
-
-				for (const word of words) {
-					const sanitizedWord = sanitizePdfString(word);
-					const testLine = currentLine + sanitizedWord + " ";
-					const textWidth = font.widthOfTextAtSize(testLine, size);
-
-					if (textWidth > maxWidth - indent) {
-						page.drawText(sanitizePdfString(currentLine.trim()), {
-							x: x + indent,
-							y,
-							size,
-							font,
-						});
-						y -= lineHeight;
-						currentLine = sanitizedWord + " ";
-					} else {
-						currentLine = testLine;
-					}
-				}
-
-				if (currentLine.trim()) {
-					page.drawText(sanitizePdfString(currentLine.trim()), {
-						x: x + indent,
-						y,
-						size,
-						font,
-					});
-					y -= lineHeight;
-				}
-
-				return y;
-			}
-
-			function drawWrappedText(page, text, x, startY, options) {
-				// simple wrapper
-				return wrapText(page, text, x, startY, 0, options);
-			}
-
-			// Functions to parse bullet lines
-			function parseBullets(text) {
-				return text
-					.split(/\r?\n/)
-					.filter((line) => line.trim().match(/^[-•]\s+/));
-			}
-
-			function drawBulletedList(page, bulletLines, x, startY, options) {
-				let y = startY;
-				bulletLines.forEach((line) => {
-					const cleanLine = line.replace(/^[-•]\s+/, "");
-					page.drawText("•", {
-						x,
-						y,
-						size: options.size,
-						font: options.font,
-					});
-					y = wrapText(page, cleanLine, x + 15, y, 0, options);
-					y -= 5;
-				});
-				return y;
-			}
-
-			// Nested Projects
-			function parseNestedProjectBullets(text) {
-				const lines = text
-					.split(/\r?\n/)
-					.map((l) => l.trim())
-					.filter(Boolean);
-				const projects = [];
-				let currentProject = null;
-
-				for (const line of lines) {
-					if (line.startsWith("• ")) {
-						if (currentProject) {
-							projects.push(currentProject);
-						}
-						currentProject = {
-							projectTitle: line.replace(/^•\s*/, ""),
-							details: [],
-						};
-					} else if (line.startsWith("- ") && currentProject) {
-						const detail = line.replace(/^-\s*/, "");
-						currentProject.details.push(detail);
-					}
-				}
-				if (currentProject) {
-					projects.push(currentProject);
-				}
-				return projects;
-			}
-
-			function drawNestedProjects(page, projects, x, y, options) {
-				const { font, size, maxWidth, lineHeight } = options;
-				const detailIndent = 30;
-
-				for (const project of projects) {
-					page.drawText(sanitizePdfString(project.projectTitle), {
-						x,
-						y,
-						size,
-						font: options.boldFont, // use bold for project title
-					});
-
-					y -= lineHeight;
-					y -= 5;
-
-					for (const detail of project.details) {
-						page.drawText("•", {
-							x: x + detailIndent - 15,
-							y,
-							size,
-							font,
-						});
-						y = wrapText(
-							page,
-							sanitizePdfString(detail),
-							x + detailIndent,
-							y,
-							0,
-							{
-								font,
-								size,
-								maxWidth,
-								lineHeight,
-							}
-						);
-						y -= 5;
-					}
-
-					y -= 10;
-				}
-				return y;
-			}
+			const professionalExperienceText = extractSection(
+				tailoredText,
+				"## Professional Experience",
+				""
+			);
 
 			// Step 3: Generate the PDF
 			const pdfDoc = await PDFDocument.create();
 			const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 			const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-			const page = pdfDoc.addPage();
+			let page = pdfDoc.addPage();
 			const { width, height } = page.getSize();
 
 			// Name & Title
 			const candidateNameFinal = candidate_name || "Candidate Name";
 			const candidateTitleFinal = candidate_title || "Candidate Title";
 
+			let yPos = height - 50;
 			page.drawText(sanitizePdfString(candidateNameFinal), {
 				x: 50,
-				y: height - 50,
+				y: yPos,
 				size: 24,
 				font,
 			});
 
+			yPos -= 30;
 			page.drawText(sanitizePdfString(candidateTitleFinal.trim()), {
 				x: 50,
-				y: height - 80,
+				y: yPos,
 				size: 16,
 				font,
 			});
 
 			// Contact Info
-			let yPos = height - 110;
-
-			// -- LINE 1: location, phone, email in black
+			yPos -= 30;
 			const contactLine1Parts = [];
 			if (candidate_location) contactLine1Parts.push(candidate_location);
 			if (candidate_phone) contactLine1Parts.push(candidate_phone);
 			if (candidate_email) contactLine1Parts.push(candidate_email);
-
 			const contactLine1 = contactLine1Parts.join(" | ");
+
 			page.drawText(sanitizePdfString(contactLine1), {
 				x: 50,
 				y: yPos,
@@ -521,13 +578,11 @@ router.post(
 			});
 			yPos -= 15;
 
-			// -- LINE 2: Pull any lines referencing LinkedIn/GitHub/Portfolio from the resume
+			// Social lines
 			const allLines = resumeText
 				.split(/\r?\n/)
-				.filter((line) => line.trim().length > 0);
+				.filter((l) => l.trim().length > 0);
 			const socialLines = parseSocialLines(allLines);
-
-			// Draw them in blue, making any http(s):// portion clickable
 			yPos = drawSocialLines(page, socialLines, 50, yPos, {
 				font,
 				size: 12,
@@ -537,6 +592,7 @@ router.post(
 			yPos -= 15;
 
 			// SUMMARY
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 			page.drawText("SUMMARY", {
 				x: 50,
 				y: yPos,
@@ -556,6 +612,7 @@ router.post(
 			});
 
 			// TECHNICAL SKILLS
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 			yPos -= 30;
 			page.drawText("TECHNICAL SKILLS", {
 				x: 50,
@@ -574,6 +631,7 @@ router.post(
 			});
 
 			// HIGHLIGHTED PROJECTS
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 			yPos -= 30;
 			page.drawText("HIGHLIGHTED PROJECTS", {
 				x: 50,
@@ -584,17 +642,44 @@ router.post(
 			yPos -= 20;
 
 			const projects = parseNestedProjectBullets(highlightedProjectsText);
-			yPos = drawNestedProjects(page, projects, 50, yPos, {
-				font,
-				boldFont,
-				size: 12,
-				maxWidth: maxTextWidth,
-				lineHeight: lineHeightVal,
+			yPos = drawNestedProjects(
+				page,
+				projects,
+				50,
+				yPos,
+				{
+					font,
+					boldFont,
+					size: 12,
+					maxWidth: maxTextWidth,
+					lineHeight: lineHeightVal,
+				},
+				pdfDoc
+			);
+
+			// PROFESSIONAL EXPERIENCE
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
+			yPos -= 30;
+			page.drawText("PROFESSIONAL EXPERIENCE", {
+				x: 50,
+				y: yPos,
+				size: 14,
+				font: boldFont,
 			});
+			yPos -= 20;
+
+			const roles = parseNestedExperienceBullets(professionalExperienceText);
+			yPos = drawNestedExperience(
+				page,
+				roles,
+				50,
+				yPos,
+				{ font, boldFont, size: 12, maxWidth: maxTextWidth, lineHeight: 14 },
+				pdfDoc
+			);
 
 			// Finalize
 			const pdfBytes = await pdfDoc.save();
-
 			res.setHeader(
 				"Content-Disposition",
 				"attachment; filename=tailored_resume.pdf"
