@@ -31,6 +31,17 @@ const unlinkFileAsync = promisify(fs.unlink);
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+function sanitizePdfString(str) {
+	if (!str) return "";
+	// Replace bullet (•) with a placeholder
+	let replaced = str.replace(/•/g, "BULLET_PLACEHOLDER");
+	// Remove all non-ASCII characters
+	replaced = replaced.replace(/[^\x00-\x7F]/g, "");
+	// Restore placeholder as an ASCII bullet marker
+	replaced = replaced.replace(/BULLET_PLACEHOLDER/g, "* ");
+	return replaced;
+}
+
 router.post(
 	"/tailor-resume",
 	authMiddleware,
@@ -126,7 +137,7 @@ router.post(
 			// Step 2: Call OpenAI (Short Summary Only)
 			const response = await openaiClient.post("/chat/completions", {
 				model: "gpt-4-turbo",
-				max_tokens: 250,
+				max_tokens: 1000,
 				messages: [
 					{
 						role: "system",
@@ -141,6 +152,21 @@ router.post(
                           Do not provide any other sections or headings.
                           Do not include any personal identifiers.
                           Do not use the phrase "the candidate."
+
+                         For Technical Skills, each bullet must begin with '- ' (dash + space).
+
+                         For Highlighted Projects, use this exact structure:
+
+                         ## Highlighted Projects
+                         • [Project Title]
+                         - [Detail line 1]
+                         - [Detail line 2]
+
+                         (blank line)
+
+                         • [Next Project Title]
+                         - [Detail line 1]
+                         - ...
                         `,
 					},
 					{
@@ -165,92 +191,7 @@ router.post(
 					},
 				],
 			});
-
-			function limitSentences(text, maxSentences) {
-				const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
-				return sentences.slice(0, maxSentences).join(" ").trim();
-			}
-
-			function extractSection(fullText, sectionHeader, nextSectionHeader) {
-				// This captures text from sectionHeader up until the nextSectionHeader or the end of text.
-				const pattern = new RegExp(
-					`${sectionHeader}[\\s\\S]*?(?=${nextSectionHeader}|$)`,
-					"i"
-				);
-				const match = fullText.match(pattern);
-				if (!match) return "";
-				// Remove the heading line itself from the extracted text
-				return match[0].replace(sectionHeader, "").trim();
-			}
-
-			let rawTailoredText = response.data.choices[0].message.content.trim();
-			let tailoredText = rawTailoredText.replace(/[^\x00-\x7F]/g, "");
-			tailoredText = tailoredText.replace(/the candidate/gi, "").trim();
-            tailoredText = tailoredText.replace(/\*\*/g, "");
-
-			const summaryText = extractSection(
-				tailoredText,
-				"## Summary",
-				"## Technical Skills"
-			);
-			const technicalSkillsText = extractSection(
-				tailoredText,
-				"## Technical Skills",
-				"$$$"
-			);
-
-			const highlightedProjectsText = extractSection(
-				tailoredText,
-				"## Highlighted Projects",
-				"$$$"
-			);
-
-			function parseBullets(text) {
-				// Splits on lines that start with dash or bullet
-				// e.g. "- " or "• "
-				return text
-					.split(/\r?\n/)
-					.filter((line) => line.trim().match(/^[-•]\s+/));
-			}
-
-			function drawBulletedList(page, bullets, x, y, options) {
-				const { font, size, maxWidth, lineHeight } = options;
-				const bulletIndent = 15; // How far from the bullet to the text
-
-				for (const bullet of bullets) {
-					// Remove the leading dash or bullet symbol
-					const lineText = bullet.replace(/^[-•]\s+/, "");
-
-					// Draw the bullet symbol on the current line
-					page.drawText("•", {
-						x,
-						y,
-						size,
-						font,
-					});
-
-					// Wrap the text for this bullet
-					y = wrapText(page, lineText, x, y, bulletIndent, {
-						font,
-						size,
-						maxWidth,
-						lineHeight,
-					});
-
-					// Add a small gap after each bullet
-					y -= 5;
-				}
-
-				return y;
-			}
-			function drawWrappedText(page, text, x, y, options) {
-				return wrapText(page, sanitizePdfString(text), x, y, 0, options);
-			}
-
-			/**
-			 * Helper function to wrap text to multiple lines within `maxWidth`.
-			 * Indents each line by `indent` so it aligns nicely under the bullet.
-			 */
+            console.log("RAW AI RESPONSE:", response.data.choices[0].message.content)
 			function wrapText(
 				page,
 				text,
@@ -297,9 +238,165 @@ router.post(
 				return y;
 			}
 
-			function sanitizePdfString(str) {
-				if (!str) return "";
-				return str.replace(/[^\x00-\x7F]/g, "");
+			function limitSentences(text, maxSentences) {
+				const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
+				return sentences.slice(0, maxSentences).join(" ").trim();
+			}
+
+			function extractSection(fullText, sectionHeader, nextSectionHeader) {
+				// This captures text from sectionHeader up until the nextSectionHeader or the end of text.
+				const pattern = new RegExp(
+					`${sectionHeader}[\\s\\S]*?(?=${nextSectionHeader}|$)`,
+					"i"
+				);
+				const match = fullText.match(pattern);
+				if (!match) return "";
+				// Remove the heading line itself from the extracted text
+				return match[0].replace(sectionHeader, "").trim();
+			}
+
+			let rawTailoredText = response.data.choices[0].message.content.trim();
+			let tailoredText = rawTailoredText;
+			tailoredText = tailoredText.replace(/the candidate/gi, "").trim();
+
+			const summaryText = extractSection(
+				tailoredText,
+				"## Summary",
+				"## Technical Skills"
+			);
+			const technicalSkillsText = extractSection(
+				tailoredText,
+				"## Technical Skills",
+				"## Highlighted Projects"
+			);
+
+			const highlightedProjectsText = extractSection(
+				tailoredText,
+				"## Highlighted Projects",
+				"$$$"
+			);
+
+			function drawWrappedText(page, text, x, startY, options) {
+				// Wrapper around wrapText with no indent
+				return wrapText(page, text, x, startY, 0, options);
+			}
+
+			function drawBulletedList(page, bulletLines, x, startY, options) {
+				let y = startY;
+				bulletLines.forEach((line) => {
+					// Remove the bullet prefix ('- ' or '• ') from the line
+					const cleanLine = line.replace(/^[-•]\s+/, "");
+					// Draw the bullet symbol
+					page.drawText("•", {
+						x: x,
+						y: y,
+						size: options.size,
+						font: options.font,
+					});
+					// Draw the bullet text with indentation
+					y = wrapText(page, cleanLine, x + 15, y, 0, options);
+					y -= 5; // add a small gap after each bullet
+				});
+				return y;
+			}
+
+			function parseBullets(text) {
+				// Splits on lines that start with dash or bullet
+				// e.g. "- " or "• "
+	return text
+		.split(/\r?\n/)
+		.filter((line) => line.trim().match(/^[-•]\s+/));
+			}
+
+			function parseNestedProjectBullets(text) {
+				const lines = text
+					.split(/\r?\n/)
+					.map((l) => l.trim())
+					.filter(Boolean);
+
+				const projects = [];
+				let currentProject = null;
+
+				for (const line of lines) {
+					// Top-level project bullet (starts with "• ")
+				if (line.startsWith("• ")) {
+						// If we had a previous project, push it to array
+						if (currentProject) {
+							projects.push(currentProject);
+						}
+						currentProject = {
+							projectTitle: line.replace(/^•\s*/, ""), // remove "• "
+							details: [],
+						};
+					}
+					// Sub-bullet line (starts with "- ")
+					else if (line.startsWith("- ") && currentProject) {
+						const detail = line.replace(/^-\s*/, ""); // remove "- "
+						currentProject.details.push(detail);
+					}
+				}
+
+				// Push the last project if it exists
+				if (currentProject) {
+					projects.push(currentProject);
+				}
+
+				return projects;
+			}
+
+			/**
+			 * Draw each project with a bullet for the title,
+			 * and sub-bullets for details.
+			 */
+			function drawNestedProjects(page, projects, x, y, options) {
+				const { font, size, maxWidth, lineHeight } = options;
+				const projectIndent = 15; // indentation for project title wrap
+				const detailIndent = 30; // indentation for sub-bullets
+
+				for (const project of projects) {
+					// 1) Draw the project title as a header using boldFont (no bullet)
+					page.drawText(sanitizePdfString(project.projectTitle), {
+						x,
+						y,
+						size,
+						font: boldFont,
+					});
+
+					y -= lineHeight;
+					y -= 5; // small gap after project title
+
+					// 2) Draw sub-bullets for each detail
+					for (const detail of project.details) {
+						// Draw a bullet symbol for the detail
+						page.drawText("•", {
+							x: x + detailIndent - 15, // adjust bullet position
+							y,
+							size,
+							font,
+						});
+
+						// Wrap the detail text (no indent on subsequent lines for detail text)
+						y = wrapText(
+							page,
+							sanitizePdfString(detail),
+							x + detailIndent,
+							y,
+							0,
+							{
+								font,
+								size,
+								maxWidth,
+								lineHeight,
+							}
+						);
+
+						y -= 5; // small gap between details
+					}
+
+					y -= 10; // extra space after each project
+				}
+
+				return y;
 			}
 
 			// Step 3: Generate a PDF (Header + Contact + Summary)
@@ -396,9 +493,10 @@ router.post(
 			});
 			yPos -= 20;
 
-			const projectsBulletLines = parseBullets(highlightedProjectsText);
+			// Parse nested structure for highlighted projects
+			const projects = parseNestedProjectBullets(highlightedProjectsText);
 
-			yPos = drawBulletedList(page, projectsBulletLines, 50, yPos, {
+			yPos = drawNestedProjects(page, projects, 50, yPos, {
 				font,
 				size: 12,
 				maxWidth: maxTextWidth,
