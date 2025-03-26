@@ -1,11 +1,4 @@
-import {
-	PDFDocument,
-	StandardFonts,
-	rgb,
-	AnnotationFlags,
-	PDFName,
-	PDFDict,
-} from "pdf-lib";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import express from "express";
 import getSupabaseClient from "../supabaseClient.js";
 import authMiddleware from "../middleware/authMiddleware.js";
@@ -31,16 +24,128 @@ const unlinkFileAsync = promisify(fs.unlink);
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+/**
+ * We keep the sanitizePdfString logic,
+ * but be aware it strips out non-ASCII (including bullet '•').
+ * If that’s causing issues, you can remove the line that strips non-ASCII.
+ */
 function sanitizePdfString(str) {
 	if (!str) return "";
 	// Replace bullet (•) with a placeholder
 	let replaced = str.replace(/•/g, "BULLET_PLACEHOLDER");
 	// Remove all non-ASCII characters
-	replaced = replaced.replace(/[^\x00-\x7F]/g, "");
+	replaced = replaced.replace(/[^\x00-\x7F•]/g, "");
 	// Restore placeholder as an ASCII bullet marker
 	replaced = replaced.replace(/BULLET_PLACEHOLDER/g, "* ");
 	return replaced;
 }
+
+function parseSocialLinks(lines) {
+	// This regex matches anything that starts with http(s):// and goes until whitespace
+	const linkRegex = /(https?:\/\/\S+)/gi;
+
+	let linkedin = "";
+	let portfolio = "";
+	let github = "";
+
+	lines.forEach((line) => {
+		// Find all URLs in the current line
+		const matches = line.match(linkRegex);
+		if (!matches) return;
+
+		matches.forEach((url) => {
+			const lowerUrl = url.toLowerCase();
+			if (lowerUrl.includes("linkedin.com")) {
+				linkedin = url;
+			} else if (lowerUrl.includes("github.com")) {
+				github = url;
+			} else if (
+				lowerUrl.includes("portfolio") ||
+				lowerUrl.includes("netlify") ||
+				lowerUrl.includes("vercel") ||
+				lowerUrl.includes("myportfolio.com")
+			) {
+				portfolio = url;
+			}
+		});
+	});
+
+	return { linkedin, portfolio, github };
+}
+
+/** NEW: parseSocialLines, extractUrls, drawSocialLines **/
+
+function parseSocialLines(lines) {
+	const socialLines = [];
+	const keywords = ["linkedin", "github", "portfolio"];
+	const ignoreIfContains = ["version control", "ci/cd"];
+
+	lines.forEach((line) => {
+		const lower = line.toLowerCase();
+
+		// If it includes 'github'/'linkedin'/'portfolio'
+		const hasKeyword = keywords.some((kw) => lower.includes(kw));
+
+		// If it also includes 'version control'/'ci/cd', we skip it
+		const hasIgnoreWord = ignoreIfContains.some((ig) => lower.includes(ig));
+
+		if (hasKeyword && !hasIgnoreWord) {
+			socialLines.push(line);
+		}
+	});
+
+	return socialLines;
+}
+
+function extractUrls(line) {
+	const urlRegex = /(https?:\/\/\S+)/gi;
+	const matches = line.match(urlRegex) || [];
+	return matches;
+}
+
+function drawSocialLines(page, lines, x, y, options) {
+	const { font, size, color, lineHeight } = options;
+
+	lines.forEach((line) => {
+		// Draw the entire social line in the chosen color
+		page.drawText(sanitizePdfString(line), {
+			x,
+			y,
+			size,
+			font,
+			color,
+		});
+
+		// If there are any URLs, create clickable link annotations
+		const urls = extractUrls(line);
+		if (urls.length > 0) {
+			let currentX = x;
+			const words = line.split(/\s+/);
+
+			// We'll do a rough measurement to place link annotations over each word
+			words.forEach((word) => {
+				const wordWidth = font.widthOfTextAtSize(word + " ", size);
+				if (urls.includes(word)) {
+					// Place an annotation over this word
+					page.linkAnnotation({
+						x: currentX,
+						y,
+						width: wordWidth,
+						height: size,
+						url: word,
+					});
+				}
+				currentX += wordWidth;
+			});
+		}
+
+		y -= lineHeight;
+	});
+
+	return y;
+}
+
+/** END NEW FUNCTIONS **/
 
 router.post(
 	"/tailor-resume",
@@ -50,7 +155,6 @@ router.post(
 		try {
 			const userId = req.user.id;
 
-			// Convert to let so we can update them
 			let {
 				job_description,
 				candidate_name,
@@ -62,7 +166,6 @@ router.post(
 
 			const resumeFile = req.file;
 
-			// Validate input
 			if (!resumeFile) {
 				return res.status(400).json({ error: "No resume file uploaded." });
 			}
@@ -96,17 +199,25 @@ router.post(
 					.status(500)
 					.json({ error: err || "Failed to extract resume text." });
 			}
+
 			if (Array.isArray(resumeText)) {
 				resumeText = resumeText.join("\n");
 			}
 
+			// Social link variables (from parseSocialLinks)
+			let linkedin = "",
+				portfolio = "",
+				github = "";
+
 			// If candidate details are missing, attempt to extract from resume text
 			{
-				// Split into non-empty lines
 				const lines = resumeText
 					.split(/\r?\n/)
 					.filter((line) => line.trim().length > 0);
 
+				({ linkedin, portfolio, github } = parseSocialLinks(lines));
+
+				// Attempt to extract candidate_name, candidate_title, etc.
 				if (!candidate_name) {
 					candidate_name = lines[0]
 						? lines[0].split(",")[0].trim()
@@ -115,7 +226,7 @@ router.post(
 				if (!candidate_title) {
 					candidate_title = lines[1] || "Candidate Title";
 				}
-				// If any of location, phone, or email is missing, parse from the 3rd line
+
 				if (!candidate_location || !candidate_phone || !candidate_email) {
 					const contactLine = lines[2] || "";
 					if (!candidate_location) {
@@ -134,7 +245,7 @@ router.post(
 				}
 			}
 
-			// Step 2: Call OpenAI (Short Summary Only)
+			// Step 2: Call OpenAI
 			const response = await openaiClient.post("/chat/completions", {
 				model: "gpt-4-turbo",
 				max_tokens: 1000,
@@ -142,56 +253,85 @@ router.post(
 					{
 						role: "system",
 						content: `
-                          You are a professional resume tailoring assistant.
-                          DO NOT reintroduce any name, phone number, email, or location.
-                          Return EXACTLY three sections in this order:
-                          1) ## Summary (3-5 sentences) - no personal projects
-                          2) ## Technical Skills (bullet points) - no personal projects
-                          3) ## Highlighted Projects (bullet points) - only place personal projects here
+                You are a professional resume tailoring assistant.
+                DO NOT reintroduce any name, phone number, email, or location.
+                Return EXACTLY three sections in this order:
+                1) ## Summary (3-5 sentences) - no personal projects
+                2) ## Technical Skills (bullet points) - no personal projects
+                3) ## Highlighted Projects (bullet points) - only place personal projects here
 
-                          Do not provide any other sections or headings.
-                          Do not include any personal identifiers.
-                          Do not use the phrase "the candidate."
+                Do not provide any other sections or headings.
+                Do not include any personal identifiers.
+                Do not use the phrase "the candidate."
 
-                         For Technical Skills, each bullet must begin with '- ' (dash + space).
+                For Technical Skills, each bullet must begin with '- ' (dash + space).
+                For Highlighted Projects, use this exact structure:
+                ## Highlighted Projects
+                • [Project Title]
+                - [Detail line 1]
+                - [Detail line 2]
 
-                         For Highlighted Projects, use this exact structure:
+                (blank line)
 
-                         ## Highlighted Projects
-                         • [Project Title]
-                         - [Detail line 1]
-                         - [Detail line 2]
-
-                         (blank line)
-
-                         • [Next Project Title]
-                         - [Detail line 1]
-                         - ...
-                        `,
+                • [Next Project Title]
+                - [Detail line 1]
+                - ...
+              `,
 					},
 					{
 						role: "user",
 						content: `
-                          Here is my original resume text (excluding name/contact info):
-                          ---
-                          ${resumeText}
-                          ---
+                Here is my original resume text (excluding name/contact info):
+                ---
+                ${resumeText}
+                ---
 
-                          Here is the job description:
-                          ---
-                          ${job_description}
-                          ---
+                Here is the job description:
+                ---
+                ${job_description}
+                ---
 
-                          Please tailor the resume text to align with the job description,
-                          returning EXACTLY three sections:
-                          1) ## Summary (3-5 sentences)
-                          2) ## Technical Skills (bullet points)
-                          3) ## Highlighted Projects (bullet points) – even if very brief.
-                        `,
+                Please tailor the resume text to align with the job description,
+                returning EXACTLY three sections:
+                1) ## Summary (3-5 sentences)
+                2) ## Technical Skills (bullet points)
+                3) ## Highlighted Projects (bullet points) – even if very brief.
+              `,
 					},
 				],
 			});
-            console.log("RAW AI RESPONSE:", response.data.choices[0].message.content)
+
+			let rawTailoredText = response.data.choices[0].message.content.trim();
+			let tailoredText = rawTailoredText.replace(/the candidate/gi, "").trim();
+
+			// We have our final text, let's extract the three sections
+			function extractSection(fullText, sectionHeader, nextSectionHeader) {
+				const pattern = new RegExp(
+					`${sectionHeader}[\\s\\S]*?(?=${nextSectionHeader}|$)`,
+					"i"
+				);
+				const match = fullText.match(pattern);
+				if (!match) return "";
+				return match[0].replace(sectionHeader, "").trim();
+			}
+
+			const summaryText = extractSection(
+				tailoredText,
+				"## Summary",
+				"## Technical Skills"
+			);
+			const technicalSkillsText = extractSection(
+				tailoredText,
+				"## Technical Skills",
+				"## Highlighted Projects"
+			);
+			const highlightedProjectsText = extractSection(
+				tailoredText,
+				"## Highlighted Projects",
+				"$$$"
+			);
+
+			// Basic text wrapping
 			function wrapText(
 				page,
 				text,
@@ -205,12 +345,11 @@ router.post(
 				let y = startY;
 
 				for (const word of words) {
-					// Sanitize each word before adding it to the line
 					const sanitizedWord = sanitizePdfString(word);
 					const testLine = currentLine + sanitizedWord + " ";
 					const textWidth = font.widthOfTextAtSize(testLine, size);
+
 					if (textWidth > maxWidth - indent) {
-						// Draw the current line, sanitizing it
 						page.drawText(sanitizePdfString(currentLine.trim()), {
 							x: x + indent,
 							y,
@@ -224,7 +363,6 @@ router.post(
 					}
 				}
 
-				// Draw any leftover text
 				if (currentLine.trim()) {
 					page.drawText(sanitizePdfString(currentLine.trim()), {
 						x: x + indent,
@@ -238,144 +376,85 @@ router.post(
 				return y;
 			}
 
-			function limitSentences(text, maxSentences) {
-				const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
-				return sentences.slice(0, maxSentences).join(" ").trim();
-			}
-
-			function extractSection(fullText, sectionHeader, nextSectionHeader) {
-				// This captures text from sectionHeader up until the nextSectionHeader or the end of text.
-				const pattern = new RegExp(
-					`${sectionHeader}[\\s\\S]*?(?=${nextSectionHeader}|$)`,
-					"i"
-				);
-				const match = fullText.match(pattern);
-				if (!match) return "";
-				// Remove the heading line itself from the extracted text
-				return match[0].replace(sectionHeader, "").trim();
-			}
-
-			let rawTailoredText = response.data.choices[0].message.content.trim();
-			let tailoredText = rawTailoredText;
-			tailoredText = tailoredText.replace(/the candidate/gi, "").trim();
-
-			const summaryText = extractSection(
-				tailoredText,
-				"## Summary",
-				"## Technical Skills"
-			);
-			const technicalSkillsText = extractSection(
-				tailoredText,
-				"## Technical Skills",
-				"## Highlighted Projects"
-			);
-
-			const highlightedProjectsText = extractSection(
-				tailoredText,
-				"## Highlighted Projects",
-				"$$$"
-			);
-
 			function drawWrappedText(page, text, x, startY, options) {
-				// Wrapper around wrapText with no indent
+				// simple wrapper
 				return wrapText(page, text, x, startY, 0, options);
+			}
+
+			// Functions to parse bullet lines
+			function parseBullets(text) {
+				return text
+					.split(/\r?\n/)
+					.filter((line) => line.trim().match(/^[-•]\s+/));
 			}
 
 			function drawBulletedList(page, bulletLines, x, startY, options) {
 				let y = startY;
 				bulletLines.forEach((line) => {
-					// Remove the bullet prefix ('- ' or '• ') from the line
 					const cleanLine = line.replace(/^[-•]\s+/, "");
-					// Draw the bullet symbol
 					page.drawText("•", {
-						x: x,
-						y: y,
+						x,
+						y,
 						size: options.size,
 						font: options.font,
 					});
-					// Draw the bullet text with indentation
 					y = wrapText(page, cleanLine, x + 15, y, 0, options);
-					y -= 5; // add a small gap after each bullet
+					y -= 5;
 				});
 				return y;
 			}
 
-			function parseBullets(text) {
-				// Splits on lines that start with dash or bullet
-				// e.g. "- " or "• "
-	return text
-		.split(/\r?\n/)
-		.filter((line) => line.trim().match(/^[-•]\s+/));
-			}
-
+			// Nested Projects
 			function parseNestedProjectBullets(text) {
 				const lines = text
 					.split(/\r?\n/)
 					.map((l) => l.trim())
 					.filter(Boolean);
-
 				const projects = [];
 				let currentProject = null;
 
 				for (const line of lines) {
-					// Top-level project bullet (starts with "• ")
-				if (line.startsWith("• ")) {
-						// If we had a previous project, push it to array
+					if (line.startsWith("• ")) {
 						if (currentProject) {
 							projects.push(currentProject);
 						}
 						currentProject = {
-							projectTitle: line.replace(/^•\s*/, ""), // remove "• "
+							projectTitle: line.replace(/^•\s*/, ""),
 							details: [],
 						};
-					}
-					// Sub-bullet line (starts with "- ")
-					else if (line.startsWith("- ") && currentProject) {
-						const detail = line.replace(/^-\s*/, ""); // remove "- "
+					} else if (line.startsWith("- ") && currentProject) {
+						const detail = line.replace(/^-\s*/, "");
 						currentProject.details.push(detail);
 					}
 				}
-
-				// Push the last project if it exists
 				if (currentProject) {
 					projects.push(currentProject);
 				}
-
 				return projects;
 			}
 
-			/**
-			 * Draw each project with a bullet for the title,
-			 * and sub-bullets for details.
-			 */
 			function drawNestedProjects(page, projects, x, y, options) {
 				const { font, size, maxWidth, lineHeight } = options;
-				const projectIndent = 15; // indentation for project title wrap
-				const detailIndent = 30; // indentation for sub-bullets
+				const detailIndent = 30;
 
 				for (const project of projects) {
-					// 1) Draw the project title as a header using boldFont (no bullet)
 					page.drawText(sanitizePdfString(project.projectTitle), {
 						x,
 						y,
 						size,
-						font: boldFont,
+						font: options.boldFont, // use bold for project title
 					});
 
 					y -= lineHeight;
-					y -= 5; // small gap after project title
+					y -= 5;
 
-					// 2) Draw sub-bullets for each detail
 					for (const detail of project.details) {
-						// Draw a bullet symbol for the detail
 						page.drawText("•", {
-							x: x + detailIndent - 15, // adjust bullet position
+							x: x + detailIndent - 15,
 							y,
 							size,
 							font,
 						});
-
-						// Wrap the detail text (no indent on subsequent lines for detail text)
 						y = wrapText(
 							page,
 							sanitizePdfString(detail),
@@ -389,17 +468,15 @@ router.post(
 								lineHeight,
 							}
 						);
-
-						y -= 5; // small gap between details
+						y -= 5;
 					}
 
-					y -= 10; // extra space after each project
+					y -= 10;
 				}
-
 				return y;
 			}
 
-			// Step 3: Generate a PDF (Header + Contact + Summary)
+			// Step 3: Generate the PDF
 			const pdfDoc = await PDFDocument.create();
 			const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 			const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
@@ -407,18 +484,18 @@ router.post(
 			const page = pdfDoc.addPage();
 			const { width, height } = page.getSize();
 
-			// Ensure both are left-aligned at x=50
-			const candidateName = candidate_name || "Candidate Name";
-			const candidateTitle = candidate_title || "Candidate Title";
+			// Name & Title
+			const candidateNameFinal = candidate_name || "Candidate Name";
+			const candidateTitleFinal = candidate_title || "Candidate Title";
 
-			page.drawText(sanitizePdfString(candidateName), {
+			page.drawText(sanitizePdfString(candidateNameFinal), {
 				x: 50,
 				y: height - 50,
 				size: 24,
 				font,
 			});
 
-			page.drawText(sanitizePdfString(candidateTitle.trim()), {
+			page.drawText(sanitizePdfString(candidateTitleFinal.trim()), {
 				x: 50,
 				y: height - 80,
 				size: 16,
@@ -427,34 +504,47 @@ router.post(
 
 			// Contact Info
 			let yPos = height - 110;
-			const contactFontSize = 12;
-			let contacts = [];
-			if (candidate_location) contacts.push({ label: candidate_location });
-			if (candidate_phone) contacts.push({ label: candidate_phone });
-			if (candidate_email) contacts.push({ label: candidate_email });
 
-			contacts.forEach((contact) => {
-				page.drawText(sanitizePdfString(contact.label), {
-					x: 50,
-					y: yPos,
-					size: contactFontSize,
-					font,
-				});
-				yPos -= 15;
+			// -- LINE 1: location, phone, email in black
+			const contactLine1Parts = [];
+			if (candidate_location) contactLine1Parts.push(candidate_location);
+			if (candidate_phone) contactLine1Parts.push(candidate_phone);
+			if (candidate_email) contactLine1Parts.push(candidate_email);
+
+			const contactLine1 = contactLine1Parts.join(" | ");
+			page.drawText(sanitizePdfString(contactLine1), {
+				x: 50,
+				y: yPos,
+				size: 12,
+				font,
+				color: rgb(0, 0, 0),
 			});
+			yPos -= 15;
 
-			// Summary Heading
-			yPos -= 30;
+			// -- LINE 2: Pull any lines referencing LinkedIn/GitHub/Portfolio from the resume
+			const allLines = resumeText
+				.split(/\r?\n/)
+				.filter((line) => line.trim().length > 0);
+			const socialLines = parseSocialLines(allLines);
+
+			// Draw them in blue, making any http(s):// portion clickable
+			yPos = drawSocialLines(page, socialLines, 50, yPos, {
+				font,
+				size: 12,
+				color: rgb(0, 0, 1),
+				lineHeight: 15,
+			});
+			yPos -= 15;
+
+			// SUMMARY
 			page.drawText("SUMMARY", {
 				x: 50,
 				y: yPos,
 				size: 14,
 				font: boldFont,
 			});
-
-			// Simple line wrapping for summary
 			yPos -= 20;
-			const lineHeight = 14;
+			const lineHeightVal = 14;
 			const margin = 50;
 			const maxTextWidth = width - margin * 2;
 
@@ -462,9 +552,10 @@ router.post(
 				font,
 				size: 12,
 				maxWidth: maxTextWidth,
-				lineHeight,
+				lineHeight: lineHeightVal,
 			});
 
+			// TECHNICAL SKILLS
 			yPos -= 30;
 			page.drawText("TECHNICAL SKILLS", {
 				x: 50,
@@ -474,16 +565,15 @@ router.post(
 			});
 			yPos -= 20;
 
-			// Parse the bullet lines
 			const bulletLines = parseBullets(technicalSkillsText);
-			// Draw them
 			yPos = drawBulletedList(page, bulletLines, 50, yPos, {
 				font,
 				size: 12,
 				maxWidth: maxTextWidth,
-				lineHeight: 14,
+				lineHeight: lineHeightVal,
 			});
 
+			// HIGHLIGHTED PROJECTS
 			yPos -= 30;
 			page.drawText("HIGHLIGHTED PROJECTS", {
 				x: 50,
@@ -493,17 +583,16 @@ router.post(
 			});
 			yPos -= 20;
 
-			// Parse nested structure for highlighted projects
 			const projects = parseNestedProjectBullets(highlightedProjectsText);
-
 			yPos = drawNestedProjects(page, projects, 50, yPos, {
 				font,
+				boldFont,
 				size: 12,
 				maxWidth: maxTextWidth,
-				lineHeight: 14,
+				lineHeight: lineHeightVal,
 			});
 
-			// Finalize PDF
+			// Finalize
 			const pdfBytes = await pdfDoc.save();
 
 			res.setHeader(
