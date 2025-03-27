@@ -299,6 +299,7 @@ function drawNestedExperience(page, roles, x, yPos, options, pdfDoc) {
 	const detailIndent = 30;
 
 	roles.forEach((role) => {
+		// Ensure there's space for this entire role heading
 		({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 		page.drawText(role.roleTitle, {
 			x,
@@ -306,11 +307,10 @@ function drawNestedExperience(page, roles, x, yPos, options, pdfDoc) {
 			size,
 			font: boldFont,
 		});
-		yPos -= lineHeight;
-		yPos -= 5;
+		yPos -= lineHeight + 5;
 
+		// Now draw each detail bullet
 		role.details.forEach((detail) => {
-			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 			page.drawText("•", {
 				x: x + detailIndent - 15,
 				y: yPos,
@@ -324,11 +324,16 @@ function drawNestedExperience(page, roles, x, yPos, options, pdfDoc) {
 				lineHeight,
 			});
 			yPos -= 5;
+
+			// Optionally call ensureSpace if bullets might be long
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 		});
 
-		yPos -= 10;
+		yPos -= 10; // gap after each role
 	});
-	return yPos;
+
+	// Return both page and yPos so the caller can keep using them
+	return { page, yPos };
 }
 
 /** Route Handler **/
@@ -430,19 +435,21 @@ router.post(
 					{
 						role: "system",
 						content: `
-                You are a professional resume tailoring assistant.
+               You are a professional resume tailoring assistant.
                 DO NOT reintroduce any name, phone number, email, or location.
-                Return EXACTLY four sections in this order:
+                Return EXACTLY five sections in this order:
                 1) ## Summary (3-5 sentences) - no personal projects
                 2) ## Technical Skills (bullet points) - no personal projects
                 3) ## Highlighted Projects (bullet points) - only place personal projects here
                 4) ## Professional Experience (bullet points for each role)
+                5) ## Education (bullet points for each education item)
 
                 Do not provide any other sections or headings.
-                Do not include any personal identifiers.
+               	Do not include any personal identifiers.
                 Do not use the phrase "the candidate."
+				Do not merge or condense any roles. Each role from the user’s original resume must appear as a separate bullet starting with ‘•’
 
-                For Technical Skills, each bullet must begin with '- ' (dash + space).
+               For Technical Skills, each bullet must begin with '- ' (dash + space).
                 For Highlighted Projects, use this exact structure:
                 ## Highlighted Projects
                 • [Project Title]
@@ -452,21 +459,32 @@ router.post(
                 (blank line)
 
                 • [Next Project Title]
-                - [Detail line 1]
+               - [Detail line 1]
                 - ...
 
                 For Professional Experience, please use this exact structure:
                 ## Professional Experience
                 • [Job Title / Company / Years]
                 - [Bullet describing an achievement]
-                - [Another bullet]
+               - [Another bullet]
 
                 (blank line)
 
                 • [Next Role Title / Company / Years]
                 - [Detail bullet]
                 - ...
-            `,
+
+                For Education, please use this exact structure:
+                ## Education
+                • [School Name / Degree / Years]
+               - [Detail bullet, if any]
+
+                (blank line)
+
+                • [Next Education Item]
+                - [Detail bullet]
+                - ...
+              `,
 					},
 					{
 						role: "user",
@@ -482,11 +500,12 @@ router.post(
                 ---
 
                 Please tailor the resume text to align with the job description,
-                returning EXACTLY four sections:
+                returning EXACTLY five sections:
                 1) ## Summary (3-5 sentences)
                 2) ## Technical Skills (bullet points)
                 3) ## Highlighted Projects (bullet points) – even if very brief.
                 4) ## Professional Experience (bullet points for each role)
+                5) ## Education (bullet points for each education item)
             `,
 					},
 				],
@@ -530,8 +549,9 @@ router.post(
 			const professionalExperienceText = extractSection(
 				tailoredText,
 				"## Professional Experience",
-				""
+				"## Education"
 			);
+			const educationText = extractSection(tailoredText, "## Education", "");
 
 			// Step 3: Generate the PDF
 			const pdfDoc = await PDFDocument.create();
@@ -669,14 +689,35 @@ router.post(
 			yPos -= 20;
 
 			const roles = parseNestedExperienceBullets(professionalExperienceText);
-			yPos = drawNestedExperience(
+			({ page, yPos } = drawNestedExperience(
 				page,
 				roles,
 				50,
 				yPos,
 				{ font, boldFont, size: 12, maxWidth: maxTextWidth, lineHeight: 14 },
 				pdfDoc
-			);
+			));
+
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
+
+			// EDUCATION
+			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
+			yPos -= 30;
+			page.drawText("EDUCATION", {
+				x: 50,
+				y: yPos,
+				size: 14,
+				font: boldFont,
+			});
+			yPos -= 20;
+
+			const eduBulletLines = parseBullets(educationText);
+			yPos = drawBulletedList(page, eduBulletLines, 50, yPos, {
+				font,
+				size: 12,
+				maxWidth: maxTextWidth,
+				lineHeight: lineHeightVal,
+			});
 
 			// Finalize
 			const pdfBytes = await pdfDoc.save();
