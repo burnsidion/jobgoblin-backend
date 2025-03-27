@@ -24,17 +24,12 @@ const unlinkFileAsync = promisify(fs.unlink);
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
-/**
- * We keep the sanitizePdfString logic,
- * but be aware it strips out non-ASCII (including bullet '•').
- */
+/** 1) sanitizePdfString, ensureSpace, parseSocialLinks, parseSocialLines, extractUrls **/
+
 function sanitizePdfString(str) {
 	if (!str) return "";
-	// Replace bullet (•) with a placeholder
 	let replaced = str.replace(/•/g, "BULLET_PLACEHOLDER");
-	// Remove all non-ASCII characters except bullet
 	replaced = replaced.replace(/[^\x00-\x7F•]/g, "");
-	// Restore placeholder as an ASCII bullet marker
 	replaced = replaced.replace(/BULLET_PLACEHOLDER/g, "* ");
 	return replaced;
 }
@@ -47,21 +42,21 @@ function ensureSpace(page, pdfDoc, yPos, threshold = 60) {
 	return { page, yPos };
 }
 
-/** Social Links & Lines **/
 function parseSocialLinks(lines) {
+	let linkedin = "";
+	let portfolio = "";
+	let github = "";
 	const linkRegex = /(https?:\/\/\S+)/gi;
-	let linkedin = "",
-		portfolio = "",
-		github = "";
-
 	lines.forEach((line) => {
 		const matches = line.match(linkRegex);
 		if (!matches) return;
 		matches.forEach((url) => {
 			const lowerUrl = url.toLowerCase();
-			if (lowerUrl.includes("linkedin.com")) linkedin = url;
-			else if (lowerUrl.includes("github.com")) github = url;
-			else if (
+			if (lowerUrl.includes("linkedin.com")) {
+				linkedin = url;
+			} else if (lowerUrl.includes("github.com")) {
+				github = url;
+			} else if (
 				lowerUrl.includes("portfolio") ||
 				lowerUrl.includes("netlify") ||
 				lowerUrl.includes("vercel") ||
@@ -71,7 +66,6 @@ function parseSocialLinks(lines) {
 			}
 		});
 	});
-
 	return { linkedin, portfolio, github };
 }
 
@@ -79,7 +73,6 @@ function parseSocialLines(lines) {
 	const socialLines = [];
 	const keywords = ["linkedin", "github", "portfolio"];
 	const ignoreIfContains = ["version control", "ci/cd"];
-
 	lines.forEach((line) => {
 		const lower = line.toLowerCase();
 		const hasKeyword = keywords.some((kw) => lower.includes(kw));
@@ -91,16 +84,28 @@ function parseSocialLines(lines) {
 	return socialLines;
 }
 
-function extractUrls(line) {
-	const urlRegex = /(https?:\/\/\S+)/gi;
-	return line.match(urlRegex) || [];
-}
-
-function drawSocialLines(page, lines, x, yPos, options) {
+/** 2) drawSocialLines **/
+function drawSocialLines(page, lines, x, yPos, options, socialLinks) {
 	const { font, size, color, lineHeight } = options;
 
 	lines.forEach((line) => {
-		page.drawText(sanitizePdfString(line), {
+		// By default, display the original line
+		let displayText = line;
+
+		// Convert the line to lowercase for keyword matching
+		const lowerLine = line.toLowerCase();
+
+		// If the line references a social site and a URL is available, display that URL
+		if (lowerLine.includes("linkedin") && socialLinks.linkedin) {
+			displayText = socialLinks.linkedin;
+		} else if (lowerLine.includes("github") && socialLinks.github) {
+			displayText = socialLinks.github;
+		} else if (lowerLine.includes("portfolio") && socialLinks.portfolio) {
+			displayText = socialLinks.portfolio;
+		}
+
+		// Draw the final text (the full URL if we replaced it)
+		page.drawText(sanitizePdfString(displayText), {
 			x,
 			y: yPos,
 			size,
@@ -108,33 +113,13 @@ function drawSocialLines(page, lines, x, yPos, options) {
 			color,
 		});
 
-		// clickable links
-		const urls = extractUrls(line);
-		if (urls.length > 0) {
-			let currentX = x;
-			const words = line.split(/\s+/);
-			words.forEach((word) => {
-				const wordWidth = font.widthOfTextAtSize(word + " ", size);
-				if (urls.includes(word)) {
-					page.linkAnnotation({
-						x: currentX,
-						y: yPos,
-						width: wordWidth,
-						height: size,
-						url: word,
-					});
-				}
-				currentX += wordWidth;
-			});
-		}
-
 		yPos -= lineHeight;
 	});
 
 	return yPos;
 }
 
-/** Wrapping & Bullets **/
+/** 3) Wrapping & Bullets **/
 function wrapText(
 	page,
 	text,
@@ -146,12 +131,10 @@ function wrapText(
 	let yPos = startYPos;
 	const words = text.split(/\s+/);
 	let currentLine = "";
-
 	words.forEach((word) => {
 		const sanitizedWord = sanitizePdfString(word);
 		const testLine = currentLine + sanitizedWord + " ";
 		const textWidth = font.widthOfTextAtSize(testLine, size);
-
 		if (textWidth > maxWidth - indent) {
 			page.drawText(sanitizePdfString(currentLine.trim()), {
 				x: x + indent,
@@ -165,7 +148,6 @@ function wrapText(
 			currentLine = testLine;
 		}
 	});
-
 	if (currentLine.trim()) {
 		page.drawText(sanitizePdfString(currentLine.trim()), {
 			x: x + indent,
@@ -175,7 +157,6 @@ function wrapText(
 		});
 		yPos -= lineHeight;
 	}
-
 	return yPos;
 }
 
@@ -203,7 +184,7 @@ function drawBulletedList(page, bulletLines, x, startYPos, options) {
 	return yPos;
 }
 
-/** Nested Projects **/
+/** 4) Projects & Experience **/
 function parseNestedProjectBullets(text) {
 	const lines = text
 		.split(/\r?\n/)
@@ -211,7 +192,6 @@ function parseNestedProjectBullets(text) {
 		.filter(Boolean);
 	const projects = [];
 	let currentProject = null;
-
 	lines.forEach((line) => {
 		if (line.startsWith("• ")) {
 			if (currentProject) projects.push(currentProject);
@@ -220,22 +200,19 @@ function parseNestedProjectBullets(text) {
 				details: [],
 			};
 		} else if (line.startsWith("- ") && currentProject) {
-			const detail = line.replace(/^-\s*/, "");
-			currentProject.details.push(detail);
+			currentProject.details.push(line.replace(/^-\s*/, ""));
 		}
 	});
 	if (currentProject) projects.push(currentProject);
-
 	return projects;
 }
 
 function drawNestedProjects(page, projects, x, yPos, options, pdfDoc) {
-	const { font, size, maxWidth, lineHeight, boldFont } = options;
+	const { font, boldFont, size, maxWidth, lineHeight } = options;
 	const detailIndent = 30;
-
-	projects.forEach((project) => {
+	projects.forEach((proj) => {
 		({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
-		page.drawText(sanitizePdfString(project.projectTitle), {
+		page.drawText(sanitizePdfString(proj.projectTitle), {
 			x,
 			y: yPos,
 			size,
@@ -243,8 +220,7 @@ function drawNestedProjects(page, projects, x, yPos, options, pdfDoc) {
 		});
 		yPos -= lineHeight;
 		yPos -= 5;
-
-		project.details.forEach((detail) => {
+		proj.details.forEach((detail) => {
 			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 			page.drawText("•", {
 				x: x + detailIndent - 15,
@@ -252,23 +228,19 @@ function drawNestedProjects(page, projects, x, yPos, options, pdfDoc) {
 				size,
 				font,
 			});
-			yPos = wrapText(
-				page,
-				sanitizePdfString(detail),
-				x + detailIndent,
-				yPos,
-				0,
-				{ font, size, maxWidth, lineHeight }
-			);
+			yPos = wrapText(page, detail, x + detailIndent, yPos, 0, {
+				font,
+				size,
+				maxWidth,
+				lineHeight,
+			});
 			yPos -= 5;
 		});
-
 		yPos -= 10;
 	});
 	return yPos;
 }
 
-/** Nested Experience **/
 function parseNestedExperienceBullets(text) {
 	const lines = text
 		.split(/\r?\n/)
@@ -276,7 +248,6 @@ function parseNestedExperienceBullets(text) {
 		.filter(Boolean);
 	const roles = [];
 	let currentRole = null;
-
 	lines.forEach((line) => {
 		if (line.startsWith("• ")) {
 			if (currentRole) roles.push(currentRole);
@@ -285,21 +256,17 @@ function parseNestedExperienceBullets(text) {
 				details: [],
 			};
 		} else if (line.startsWith("- ") && currentRole) {
-			const detail = line.replace(/^-\s*/, "");
-			currentRole.details.push(detail);
+			currentRole.details.push(line.replace(/^-\s*/, ""));
 		}
 	});
 	if (currentRole) roles.push(currentRole);
-
 	return roles;
 }
 
 function drawNestedExperience(page, roles, x, yPos, options, pdfDoc) {
 	const { font, boldFont, size, maxWidth, lineHeight } = options;
 	const detailIndent = 30;
-
 	roles.forEach((role) => {
-		// Ensure there's space for this entire role heading
 		({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 		page.drawText(role.roleTitle, {
 			x,
@@ -308,8 +275,6 @@ function drawNestedExperience(page, roles, x, yPos, options, pdfDoc) {
 			font: boldFont,
 		});
 		yPos -= lineHeight + 5;
-
-		// Now draw each detail bullet
 		role.details.forEach((detail) => {
 			page.drawText("•", {
 				x: x + detailIndent - 15,
@@ -324,19 +289,14 @@ function drawNestedExperience(page, roles, x, yPos, options, pdfDoc) {
 				lineHeight,
 			});
 			yPos -= 5;
-
-			// Optionally call ensureSpace if bullets might be long
 			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 		});
-
-		yPos -= 10; // gap after each role
+		yPos -= 10;
 	});
-
-	// Return both page and yPos so the caller can keep using them
 	return { page, yPos };
 }
 
-/** Route Handler **/
+/** 5) The Route **/
 router.post(
 	"/tailor-resume",
 	authMiddleware,
@@ -394,12 +354,19 @@ router.post(
 			}
 
 			// If candidate details are missing, attempt to extract from resume text
+			let linkedin = "";
+			let portfolio = "";
+			let github = "";
 			{
 				const lines = resumeText
 					.split(/\r?\n/)
 					.filter((line) => line.trim().length > 0);
+
 				// parse social links
-				let { linkedin, portfolio, github } = parseSocialLinks(lines);
+				const socialObj = parseSocialLinks(lines);
+				linkedin = socialObj.linkedin;
+				portfolio = socialObj.portfolio;
+				github = socialObj.github;
 
 				if (!candidate_name) {
 					candidate_name = lines[0]
@@ -427,7 +394,7 @@ router.post(
 				}
 			}
 
-			// Step 2: Call OpenAI
+			// Extract sections
 			const response = await openaiClient.post("/chat/completions", {
 				model: "gpt-4-turbo",
 				max_tokens: 1000,
@@ -435,86 +402,84 @@ router.post(
 					{
 						role: "system",
 						content: `
-               You are a professional resume tailoring assistant.
-                DO NOT reintroduce any name, phone number, email, or location.
-                Return EXACTLY five sections in this order:
-                1) ## Summary (3-5 sentences) - no personal projects
-                2) ## Technical Skills (bullet points) - no personal projects
-                3) ## Highlighted Projects (bullet points) - only place personal projects here
-                4) ## Professional Experience (bullet points for each role)
-                5) ## Education (bullet points for each education item)
+	   You are a professional resume tailoring assistant.
+		DO NOT reintroduce any name, phone number, email, or location.
+		Return EXACTLY five sections in this order:
+		1) ## Summary (3-5 sentences) - no personal projects
+		2) ## Technical Skills (bullet points) - no personal projects
+		3) ## Highlighted Projects (bullet points) - only place personal projects here
+		4) ## Professional Experience (bullet points for each role)
+		5) ## Education (bullet points for each education item)
 
-                Do not provide any other sections or headings.
-               	Do not include any personal identifiers.
-                Do not use the phrase "the candidate."
-				Do not merge or condense any roles. Each role from the user’s original resume must appear as a separate bullet starting with ‘•’
+		Do not provide any other sections or headings.
+		   Do not include any personal identifiers.
+		Do not use the phrase "the candidate."
+		Do not merge or condense any roles. Each role from the user’s original resume must appear as a separate bullet starting with ‘•’
 
-               For Technical Skills, each bullet must begin with '- ' (dash + space).
-                For Highlighted Projects, use this exact structure:
-                ## Highlighted Projects
-                • [Project Title]
-                - [Detail line 1]
-                - [Detail line 2]
+	   For Technical Skills, each bullet must begin with '- ' (dash + space).
+		For Highlighted Projects, use this exact structure:
+		## Highlighted Projects
+		• [Project Title]
+		- [Detail line 1]
+		- [Detail line 2]
 
-                (blank line)
+		(blank line)
 
-                • [Next Project Title]
-               - [Detail line 1]
-                - ...
+		• [Next Project Title]
+	   - [Detail line 1]
+		- ...
 
-                For Professional Experience, please use this exact structure:
-                ## Professional Experience
-                • [Job Title / Company / Years]
-                - [Bullet describing an achievement]
-               - [Another bullet]
+		For Professional Experience, please use this exact structure:
+		## Professional Experience
+		• [Job Title / Company / Years]
+		- [Bullet describing an achievement]
+	   - [Another bullet]
 
-                (blank line)
+		(blank line)
 
-                • [Next Role Title / Company / Years]
-                - [Detail bullet]
-                - ...
+		• [Next Role Title / Company / Years]
+		- [Detail bullet]
+		- ...
 
-                For Education, please use this exact structure:
-                ## Education
-                • [School Name / Degree / Years]
-               - [Detail bullet, if any]
+		For Education, please use this exact structure:
+		## Education
+		• [School Name / Degree / Years]
+	   - [Detail bullet, if any]
 
-                (blank line)
+		(blank line)
 
-                • [Next Education Item]
-                - [Detail bullet]
-                - ...
-              `,
+		• [Next Education Item]
+		- [Detail bullet]
+		- ...
+	  `,
 					},
 					{
 						role: "user",
 						content: `
-                Here is my original resume text (excluding name/contact info):
-                ---
-                ${resumeText}
-                ---
+		Here is my original resume text (excluding name/contact info):
+		---
+		${resumeText}
+		---
 
-                Here is the job description:
-                ---
-                ${job_description}
-                ---
+		Here is the job description:
+		---
+		${job_description}
+		---
 
-                Please tailor the resume text to align with the job description,
-                returning EXACTLY five sections:
-                1) ## Summary (3-5 sentences)
-                2) ## Technical Skills (bullet points)
-                3) ## Highlighted Projects (bullet points) – even if very brief.
-                4) ## Professional Experience (bullet points for each role)
-                5) ## Education (bullet points for each education item)
-            `,
+		Please tailor the resume text to align with the job description,
+		returning EXACTLY five sections:
+		1) ## Summary (3-5 sentences)
+		2) ## Technical Skills (bullet points)
+		3) ## Highlighted Projects (bullet points) – even if very brief.
+		4) ## Professional Experience (bullet points for each role)
+		5) ## Education (bullet points for each education item)
+	`,
 					},
 				],
 			});
 
-			let rawTailoredText = response.data.choices[0].message.content.trim();
-			let tailoredText = rawTailoredText.replace(/the candidate/gi, "").trim();
+			const tailoredText = response.data.choices[0].message.content.trim();
 
-			// Extract sections
 			function extractSection(fullText, sectionHeader, nextSectionHeader) {
 				let pattern;
 				if (!nextSectionHeader) {
@@ -553,7 +518,7 @@ router.post(
 			);
 			const educationText = extractSection(tailoredText, "## Education", "");
 
-			// Step 3: Generate the PDF
+			// Step 3: Generate PDF
 			const pdfDoc = await PDFDocument.create();
 			const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 			const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
@@ -561,12 +526,8 @@ router.post(
 			let page = pdfDoc.addPage();
 			const { width, height } = page.getSize();
 
-			// Name & Title
-			const candidateNameFinal = candidate_name || "Candidate Name";
-			const candidateTitleFinal = candidate_title || "Candidate Title";
-
 			let yPos = height - 50;
-			page.drawText(sanitizePdfString(candidateNameFinal), {
+			page.drawText(sanitizePdfString(candidate_name), {
 				x: 50,
 				y: yPos,
 				size: 24,
@@ -574,14 +535,14 @@ router.post(
 			});
 
 			yPos -= 30;
-			page.drawText(sanitizePdfString(candidateTitleFinal.trim()), {
+			page.drawText(sanitizePdfString(candidate_title.trim()), {
 				x: 50,
 				y: yPos,
 				size: 16,
 				font,
 			});
 
-			// Contact Info
+			// Contact info
 			yPos -= 30;
 			const contactLine1Parts = [];
 			if (candidate_location) contactLine1Parts.push(candidate_location);
@@ -599,17 +560,23 @@ router.post(
 			yPos -= 15;
 
 			// Social lines
-			const allLines = resumeText
-				.split(/\r?\n/)
-				.filter((l) => l.trim().length > 0);
-			const socialLines = parseSocialLines(allLines);
-			yPos = drawSocialLines(page, socialLines, 50, yPos, {
-				font,
-				size: 12,
-				color: rgb(0, 0, 1),
-				lineHeight: 15,
-			});
-			yPos -= 15;
+			if (linkedin || portfolio || github) {
+				const allLines = resumeText
+					.split(/\r?\n/)
+					.filter((l) => l.trim().length > 0);
+				const socialLines = parseSocialLines(allLines);
+				yPos = drawSocialLines(
+					page,
+					socialLines,
+					50,
+					yPos,
+					{ font, size: 12, color: rgb(0, 0, 1), lineHeight: 15, pdfDoc },
+					{ linkedin, portfolio, github }
+				);
+				yPos -= 15;
+			} else {
+				yPos -= 30;
+			}
 
 			// SUMMARY
 			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
@@ -621,9 +588,7 @@ router.post(
 			});
 			yPos -= 20;
 			const lineHeightVal = 14;
-			const margin = 50;
-			const maxTextWidth = width - margin * 2;
-
+			const maxTextWidth = width - 100;
 			yPos = drawWrappedText(page, summaryText, 50, yPos, {
 				font,
 				size: 12,
@@ -641,7 +606,6 @@ router.post(
 				font: boldFont,
 			});
 			yPos -= 20;
-
 			const bulletLines = parseBullets(technicalSkillsText);
 			yPos = drawBulletedList(page, bulletLines, 50, yPos, {
 				font,
@@ -660,7 +624,6 @@ router.post(
 				font: boldFont,
 			});
 			yPos -= 20;
-
 			const projects = parseNestedProjectBullets(highlightedProjectsText);
 			yPos = drawNestedProjects(
 				page,
@@ -687,18 +650,21 @@ router.post(
 				font: boldFont,
 			});
 			yPos -= 20;
-
 			const roles = parseNestedExperienceBullets(professionalExperienceText);
 			({ page, yPos } = drawNestedExperience(
 				page,
 				roles,
 				50,
 				yPos,
-				{ font, boldFont, size: 12, maxWidth: maxTextWidth, lineHeight: 14 },
+				{
+					font,
+					boldFont,
+					size: 12,
+					maxWidth: maxTextWidth,
+					lineHeight: 14,
+				},
 				pdfDoc
 			));
-
-			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
 
 			// EDUCATION
 			({ page, yPos } = ensureSpace(page, pdfDoc, yPos, 60));
@@ -710,7 +676,6 @@ router.post(
 				font: boldFont,
 			});
 			yPos -= 20;
-
 			const eduBulletLines = parseBullets(educationText);
 			yPos = drawBulletedList(page, eduBulletLines, 50, yPos, {
 				font,
