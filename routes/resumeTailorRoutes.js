@@ -10,6 +10,7 @@ import path from "path";
 import { promisify } from "util";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
+import { v2 as cloudinary } from "cloudinary";
 
 const pdfOptions = {
 	exec: "/usr/local/bin/pdftotext",
@@ -686,12 +687,30 @@ router.post(
 
 			// Finalize
 			const pdfBytes = await pdfDoc.save();
-			res.setHeader(
-				"Content-Disposition",
-				"attachment; filename=tailored_resume.pdf"
+			// Write the PDF bytes to a temporary file
+			const tempTailoredPdfPath = path.join(__dirname, "../temp_tailored_resume.pdf");
+			await writeFileAsync(tempTailoredPdfPath, pdfBytes);
+
+			// Upload the first page of the PDF as a PNG preview image to Cloudinary
+			const cloudinaryResponse = await cloudinary.uploader.upload(
+			  tempTailoredPdfPath,
+			  {
+				folder: "tailored_resume_previews",
+				resource_type: "image",
+				format: "png",
+				pages: "1",
+			  }
 			);
-			res.setHeader("Content-Type", "application/pdf");
-			return res.send(Buffer.from(pdfBytes));
+
+			// Clean up the temporary file
+			await unlinkFileAsync(tempTailoredPdfPath);
+
+			// Get the preview URL from Cloudinary
+			const tailoredPreviewUrl = cloudinaryResponse.secure_url;
+
+			return res.status(200).json({
+			  tailoredPreviewUrl
+			});
 		} catch (error) {
 			console.error(
 				"Error calling OpenAI:",
