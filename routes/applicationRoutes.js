@@ -3,7 +3,6 @@ import getSupabaseClient from "../supabaseClient.js";
 import authMiddleware from "../middleware/authMiddleware.js";
 import multer from "multer";
 
-
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -32,9 +31,10 @@ router.post("/", authMiddleware, async (req, res) => {
 			job_link,
 			job_description,
 			date_applied,
-			status,
 			resume_used,
 		} = req.body;
+
+		const status = "open";
 
 		const application = {
 			user_id: userId,
