@@ -313,12 +313,29 @@ router.post(
 				candidate_location,
 				candidate_phone,
 				candidate_email,
+				base_resume_url,
 			} = req.body;
 
-			const resumeFile = req.file;
-			if (!resumeFile) {
-				return res.status(400).json({ error: "No resume file uploaded." });
+			let resumeBuffer = null;
+			if (req.file) {
+				resumeBuffer = req.file.buffer;
+			} else if (base_resume_url) {
+				try {
+					const fetch = (await import("../utils/fetch.js")).default;
+					const fileRes = await fetch(base_resume_url);
+					if (!fileRes.ok) throw new Error("Failed to fetch resume file");
+					resumeBuffer = await fileRes.buffer();
+				} catch (err) {
+					return res
+						.status(400)
+						.json({ error: "Failed to fetch resume from URL." });
+				}
+			} else {
+				return res
+					.status(400)
+					.json({ error: "No resume file uploaded or URL provided." });
 			}
+
 			if (!job_description) {
 				return res.status(400).json({ error: "Job description is required." });
 			}
@@ -342,7 +359,7 @@ router.post(
 			};
 
 			try {
-				resumeText = await parsePDF(resumeFile.buffer);
+				resumeText = await parsePDF(resumeBuffer);
 			} catch (err) {
 				console.error("PDF Parsing Error:", err);
 				return res
@@ -688,18 +705,21 @@ router.post(
 			// Finalize
 			const pdfBytes = await pdfDoc.save();
 			// Write the PDF bytes to a temporary file
-			const tempTailoredPdfPath = path.join(__dirname, "../temp_tailored_resume.pdf");
+			const tempTailoredPdfPath = path.join(
+				__dirname,
+				"../temp_tailored_resume.pdf"
+			);
 			await writeFileAsync(tempTailoredPdfPath, pdfBytes);
 
 			// Upload the first page of the PDF as a PNG preview image to Cloudinary
 			const cloudinaryResponse = await cloudinary.uploader.upload(
-			  tempTailoredPdfPath,
-			  {
-				folder: "tailored_resume_previews",
-				resource_type: "image",
-				format: "png",
-				pages: "1",
-			  }
+				tempTailoredPdfPath,
+				{
+					folder: "tailored_resume_previews",
+					resource_type: "image",
+					format: "png",
+					pages: "1",
+				}
 			);
 
 			// Clean up the temporary file
@@ -709,7 +729,7 @@ router.post(
 			const tailoredPreviewUrl = cloudinaryResponse.secure_url;
 
 			return res.status(200).json({
-			  tailoredPreviewUrl
+				tailoredPreviewUrl,
 			});
 		} catch (error) {
 			console.error(
